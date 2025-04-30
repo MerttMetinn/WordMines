@@ -1,0 +1,85 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+app-example
+
+# OS dosyaları
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Firebase cache
+.firebase/
+
+# Log dosyaları
+logs
+*.log
+
+# Derlenmiş binary dosyalar
+*.apk
+*.aab
+*.ipa
+
+# Test coverage
+coverage/
+
+# Yerel ayarlar
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# iOS build dosyaları
+ios/build/
+ios/Pods/
+ios/Podfile.lock
+
+# Android build dosyaları
+android/app/build/
+android/build/
+android/captures/
+android/gradlew
+android/gradlew.bat
+android/local.properties
