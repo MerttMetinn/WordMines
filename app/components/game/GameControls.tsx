@@ -34,10 +34,11 @@ const GameControls: React.FC<GameControlsProps> = ({
   const [displayPlayerTime, setDisplayPlayerTime] = useState(playerRemainingTime);
   const [displayOpponentTime, setDisplayOpponentTime] = useState(opponentRemainingTime);
   
-  // Son güncelleme zamanını izleyen ref
-  const lastUpdateRef = useRef<number>(Date.now());
+  // Zamanlayıcıları sync et - props değerlerini kullan
+  useEffect(() => {
+    setDisplayTime(remainingTime);
+  }, [remainingTime]);
   
-  // Süreleri props değiştiğinde güncelle
   useEffect(() => {
     setDisplayPlayerTime(playerRemainingTime);
   }, [playerRemainingTime]);
@@ -46,77 +47,20 @@ const GameControls: React.FC<GameControlsProps> = ({
     setDisplayOpponentTime(opponentRemainingTime);
   }, [opponentRemainingTime]);
   
+  // Ekran zamanlayıcısı - 1 saniyede bir görsel güncelleme
   useEffect(() => {
-    setDisplayTime(remainingTime);
-  }, [remainingTime]);
-  
-  // Aktif sıra zamanlayıcısı
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setDisplayTime(prevTime => {
-        if (prevTime <= 0) return 0;
-        return prevTime - 1;
-      });
-    }, 1000);
+    let timer: NodeJS.Timeout | null = null;
     
-    return () => clearInterval(timer);
-  }, [remainingTime, isMyTurn]);
-  
-  // Oyuncu süresini güncelleyen useEffect
-  useEffect(() => {
-    if (isMyTurn) {
-      const playerTimer = setInterval(() => {
-        setDisplayPlayerTime(prevTime => {
-          if (prevTime <= 0) return 0;
-          const newTime = prevTime - 1;
-          
-          // Süre güncellendiğinde, üst bileşene bildir
-          // Güncellemeleri sınırla: sadece belirli aralıklarla veya kritik sürelerde gönder
-          const now = Date.now();
-          if (onTimeUpdate && 
-             (newTime % 5 === 0 || // Her 5 saniyede bir
-              newTime <= 10 || // Son 10 saniye kritik
-              now - lastUpdateRef.current >= 5000)) { // En az 5 saniye geçtiyse
-            
-            onTimeUpdate(newTime, displayOpponentTime);
-            lastUpdateRef.current = now;
-          }
-          
-          return newTime;
-        });
+    if (displayTime > 0) {
+      timer = setInterval(() => {
+        setDisplayTime(prev => Math.max(0, prev - 1));
       }, 1000);
-      
-      return () => clearInterval(playerTimer);
     }
-  }, [isMyTurn, displayOpponentTime, onTimeUpdate]);
-  
-  // Rakip süresini güncelleyen useEffect
-  useEffect(() => {
-    if (!isMyTurn) {
-      const opponentTimer = setInterval(() => {
-        setDisplayOpponentTime(prevTime => {
-          if (prevTime <= 0) return 0;
-          const newTime = prevTime - 1;
-          
-          // Süre güncellendiğinde, üst bileşene bildir
-          // Güncellemeleri sınırla: sadece belirli aralıklarla veya kritik sürelerde gönder
-          const now = Date.now();
-          if (onTimeUpdate && 
-             (newTime % 5 === 0 || // Her 5 saniyede bir
-              newTime <= 10 || // Son 10 saniye kritik
-              now - lastUpdateRef.current >= 5000)) { // En az 5 saniye geçtiyse
-            
-            onTimeUpdate(displayPlayerTime, newTime);
-            lastUpdateRef.current = now;
-          }
-          
-          return newTime;
-        });
-      }, 1000);
-      
-      return () => clearInterval(opponentTimer);
-    }
-  }, [isMyTurn, displayPlayerTime, onTimeUpdate]);
+    
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [displayTime > 0]);
   
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);

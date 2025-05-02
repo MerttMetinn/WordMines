@@ -1,4 +1,5 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import React from 'react';
 import { 
   View, 
   Text, 
@@ -6,10 +7,11 @@ import {
   TouchableOpacity, 
   ScrollView, 
   Alert,
-  ActivityIndicator
+  ActivityIndicator,
+  BackHandler
 } from 'react-native';
-import { useRouter, useLocalSearchParams } from 'expo-router';
-import { doc, onSnapshot, updateDoc, getDoc } from 'firebase/firestore';
+import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
+import { doc, onSnapshot, updateDoc, getDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../firebase';
 import { useAuth } from '../context/auth';
 import { Game, GameStatus, getDurationInSeconds } from '../utils/gameUtils';
@@ -23,7 +25,7 @@ import Rack from '../components/game/Rack';
 import GameControls from '../components/game/GameControls';
 
 // Yardımcılar
-import { createEmptyBoard, shuffleArray } from '../utils/gameHelpers';
+import { createEmptyBoard, shuffleArray, calculateWordScore } from '../utils/gameHelpers';
 import { TileData, LETTER_COUNTS } from '../utils/gameConstants';
 
 export default function GamePlayScreen() {
@@ -54,6 +56,42 @@ export default function GamePlayScreen() {
   // Zamanlayıcı için referans
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   
+  // Kullanıcının yerleştirdiği taşları izlemek için ref
+  const placedTilesRef = useRef<boolean>(false);
+  
+  // İlk hamle ve yerleştirilen harflerin durumunu izle
+  const { hasPermanentLetter, placedThisTurn } = useMemo(() => {
+    let perm = false, placed = false;
+    board.forEach(row => row.forEach(t => {
+      if (t.letter) {
+        if (t.isPlaced) placed = true;
+        else perm = true;
+      }
+    }));
+    return { hasPermanentLetter: perm, placedThisTurn: placed };
+  }, [board]);
+  
+  // Geri tuşunu yönet (donanım geri tuşu)
+  useFocusEffect(
+    React.useCallback(() => {
+      const onBackPress = () => {
+        // Oyundan çıkmak istediğinden emin misin?
+      Alert.alert(
+          'Oyundan çıkmak üzeresiniz',
+          'Oyundan çıkmak istediğinize emin misiniz?',
+          [
+            { text: 'Vazgeç', style: 'cancel' },
+            { text: 'Çık', onPress: () => router.replace('/dashboard') }
+          ]
+        );
+        return true; // Geri tuşunun varsayılan davranışını engelle
+      };
+
+      BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => BackHandler.removeEventListener('hardwareBackPress', onBackPress);
+    }, [router])
+  );
+  
   // Kelime listesini yükle
   useEffect(() => {
     // Kelime listesini yükle
@@ -83,10 +121,207 @@ export default function GamePlayScreen() {
     // ... Mevcut kod ...
   }, [game, loading, user]);
   
-  // Zaman sayacı
+  // Kalan süreyi hesaplayan yardımcı fonksiyon
+  const deriveRemaining = useCallback(
+    (turnSec: number, last: Timestamp | undefined, isMyTurn: boolean): number => {
+      if (!last) return turnSec; // lastMoveAt yoksa tam süreyi döndür
+      
+      return isMyTurn
+        ? Math.max(0, turnSec - Math.floor((Date.now() - last.toMillis()) / 1000))
+        : turnSec; // sıra rakipteyse tam süre
+    },
+    []
+  );
+  
+  // Oyun durumunu dinle
   useEffect(() => {
-    // ... Mevcut kod ...
-  }, [isMyTurn, game]);
+    if (!gameId) {
+      setError('Oyun bilgisi bulunamadı');
+      return;
+    }
+    
+    console.log('🎮 Oyun verilerini dinliyoruz:', gameId);
+    
+    const unsubscribe = onSnapshot(
+      doc(db, 'games', gameId),
+      (docSnapshot) => {
+        if (docSnapshot.exists()) {
+          const gameData = docSnapshot.data() as Game;
+          
+          // Oyun nesnesini state'e kaydet
+          setGame({
+            ...gameData,
+            id: docSnapshot.id
+          });
+          
+          // Oyun durumunu kontrol et
+          if (gameData.status !== GameStatus.ACTIVE) {
+            if (gameData.status === GameStatus.COMPLETED || gameData.status === GameStatus.TIMEOUT) {
+              Alert.alert(
+                'Oyun Sona Erdi',
+                gameData.winnerId ? 'Kazanan belli oldu!' : 'Süre doldu!',
+                [
+                  { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
+                ]
+              );
+            } else {
+              setError('Bu oyun artık aktif değil');
+            }
+            return; // Durumla ilgili işlem yaptık, devam etmeye gerek yok
+          }
+          
+          // Oyun aktifse ve letterPool yoksa, oyunu başlat
+          if (!gameData.letterPool || gameData.letterPool.length === 0) {
+            console.log('🎮 Oyun başlatılacak - letterPool henüz oluşturulmamış');
+            initializeGame();
+            return; // Oyun başlatıldı, devam etmeye gerek yok
+          }
+          
+          // Kullanıcı harflerini yerleştirdi mi kontrol et
+          const hasPlacedTiles = board.some(row => row.some(t => t.isPlaced && t.letter));
+          placedTilesRef.current = hasPlacedTiles;
+          
+          // Kullanıcı ID'lerini al
+          if (user) {
+            const userId = (user as any).uid;
+            const isCreator = userId === gameData.creator;
+            const opponentId = isCreator ? gameData.opponent : gameData.creator;
+            
+            // Sıranın kimde olduğunu kontrol et
+            const isUserTurn = gameData.currentTurn === userId;
+                  
+            // Tahtayı güncelle - ancak oyuncunun sırası ve yerleştirdiği harfler varsa güncelleme
+            if (gameData.board && !(isUserTurn && placedTilesRef.current)) {
+              const newBoard = createEmptyBoard();
+              Object.entries(gameData.board).forEach(([key, letter]) => {
+                const [row, col] = key.split(',').map(Number);
+                if (row >= 0 && row < 15 && col >= 0 && col < 15) {
+                  newBoard[row][col].letter = letter;
+                }
+              });
+              setBoard(newBoard);
+            }
+            
+            // Harfleri yükle - yerleştirilmiş harfler yoksa
+            if (gameData.playerRacks && gameData.playerRacks[userId] && !placedTilesRef.current) {
+              setPlayerRack(gameData.playerRacks[userId]);
+              setLetterPool(gameData.letterPool || []);
+            }
+            
+            // Puanları güncelle
+            if (gameData.scores) {
+              setPlayerScore(gameData.scores[userId] || 0);
+              setOpponentScore(gameData.scores[opponentId || ''] || 0);
+            }
+            
+            // Sırayı güncelle - yerleştirilmiş harfler varsa ve bu kullanıcının sırası ise değiştirme
+            if (!(isUserTurn && placedTilesRef.current)) {
+              setIsMyTurn(isUserTurn);
+            }
+            
+            // Kalan süreyi hesapla
+            const turnDuration = gameData.turnDuration || 300; // Varsayılan olarak 5 dakika
+            
+            // Kullanıcının kalan süresini hesapla
+            const playerRemaining = deriveRemaining(
+              turnDuration, 
+              gameData.lastMoveAt, 
+              isUserTurn
+            );
+            
+            // Rakibin kalan süresini hesapla
+            const opponentRemaining = deriveRemaining(
+              turnDuration,
+              gameData.lastMoveAt,
+              !isUserTurn
+            );
+            
+            // Aktif oyuncunun kalan süresini güncelle
+            setRemainingTime(isUserTurn ? playerRemaining : opponentRemaining);
+            
+            // Oyuncu ve rakip sürelerini güncelle
+            setPlayerRemainingTime(isUserTurn ? playerRemaining : turnDuration);
+            setOpponentRemainingTime(!isUserTurn ? opponentRemaining : turnDuration);
+            
+            // Süre kontrol et - eğer süre bittiyse oyunu bitir
+            if (isUserTurn && playerRemaining === 0) {
+              handleTimeout();
+            }
+          }
+        }
+        
+        setLoading(false);
+      },
+      (error) => {
+        console.error('Oyun dinleme hatası:', error);
+        setError('Oyun bilgisi alınamadı');
+        setLoading(false);
+      }
+    );
+    
+    return () => unsubscribe();
+  }, [gameId, user, router, deriveRemaining]);
+  
+  // Süre dolduğunda çağrılacak fonksiyon
+  const handleTimeout = async () => {
+    if (!user || !gameId || !game) return;
+    
+    try {
+      console.log('⏱️ Süre doldu');
+      
+      // Sürenin sıfıra düştüğünü doğrula
+      const userId = (user as any).uid;
+      const opponentId = userId === game.creator ? game.opponent : game.creator;
+      
+      if (!opponentId) {
+        throw new Error('Rakip bulunamadı');
+      }
+      
+      // Lokal olarak sırayı değiştir
+      setIsMyTurn(false);
+      
+      // Oyunu timeout ile bitir, rakibi kazanan olarak işaretle
+      const gameRef = doc(db, 'games', gameId);
+      await updateDoc(gameRef, {
+        status: GameStatus.TIMEOUT,
+        winnerId: opponentId,
+        endTime: serverTimestamp()
+      });
+      
+      Toast.show({
+        type: 'error',
+        text1: 'Süre Doldu',
+        text2: 'Süreniz doldu. Rakibiniz kazandı.',
+        position: 'bottom',
+      });
+      
+      Alert.alert(
+        'Süre Doldu',
+        'Süreniz doldu. Oyun sona erdi.',
+        [
+          { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
+        ]
+      );
+    } catch (error) {
+      console.error('Süre doldurma hatası:', error);
+    }
+  };
+  
+  // Zaman güncellemelerini işle - artık sadece local state güncellemesi yapılıyor, veritabanına yazma yok
+  const handleTimeUpdate = (playerTime: number, opponentTime: number) => {
+    if (playerTime !== playerRemainingTime) {
+      setPlayerRemainingTime(playerTime);
+    }
+    
+    if (opponentTime !== opponentRemainingTime) {
+      setOpponentRemainingTime(opponentTime);
+    }
+    
+    // Süre dolmuşsa ve sıra bendeyse timeout işlemi yap
+    if (playerTime === 0 && isMyTurn) {
+      handleTimeout();
+    }
+  };
   
   // Yeni oyun başlatma - harf havuzu oluşturma
   const initializeGame = async () => {
@@ -129,12 +364,6 @@ export default function GamePlayScreen() {
         const player1Id = gameData.creator;
         const player2Id = gameData.opponent || '';
         
-        console.log('🎮 Oyuncular:', {
-          player1Id,
-          player2Id,
-          bizimID: (user as any).uid
-        });
-        
         // Oyuncuların harflerini belirle
         const playerRacks: Record<string, string[]> = {};
         playerRacks[player1Id] = player1Rack;
@@ -147,18 +376,9 @@ export default function GamePlayScreen() {
         const userRack = userId === player1Id ? player1Rack : player2Rack;
         
         setPlayerRack(userRack);
-        console.log('🎮 Kullanıcı harfleri ayarlandı:', {
-          userId,
-          harfler: userRack
-        });
         
         // Sırayı rastgele belirle
         const startingPlayer = Math.random() < 0.5 ? player1Id : player2Id;
-        
-        console.log('🎮 Başlangıç oyuncusu:', {
-          startingPlayer,
-          bizMiyiz: startingPlayer === userId
-        });
         
         // Başlangıç puanları
         const scores: Record<string, number> = {};
@@ -167,57 +387,34 @@ export default function GamePlayScreen() {
           scores[player2Id] = 0;
         }
         
-        // Oyun süreleri
+        // Oyun süresini al
         const durationType = gameData.durationType;
         const gameTimeSeconds = getDurationInSeconds(durationType);
-        
-        // Her oyuncuya kendi süresi
-        const playerTimes: Record<string, number> = {};
-        playerTimes[player1Id] = gameTimeSeconds;
-        if (player2Id) {
-          playerTimes[player2Id] = gameTimeSeconds;
-        }
-        
-        console.log('🎮 Oyun süreleri ayarlandı:', {
-          durationType,
-          gameTimeSeconds,
-          playerTimes
-        });
         
         // Süre bilgilerini yerel state'e ayarla
         setPlayerRemainingTime(gameTimeSeconds);
         setOpponentRemainingTime(gameTimeSeconds);
-        
-        // Aktif oyuncunun süresini göster
-        if (startingPlayer === userId) {
           setRemainingTime(gameTimeSeconds);
-        } else if (player2Id) {
-          setRemainingTime(gameTimeSeconds);
-        }
         
-        // Veritabanında güncelle - playerTimes hariç
+        // Veritabanında güncelle
         await updateDoc(gameRef, {
           letterPool: shuffledPool,
           playerRacks,
           currentTurn: startingPlayer,
-          startTime: Timestamp.now(),
+          startTime: serverTimestamp(),
+          lastMoveAt: serverTimestamp(), // Oyun başlangıç zamanı
+          turnDuration: gameTimeSeconds, // Her hamle için süre sınırı
           scores,
           board: {}  // Boş tahta
         });
         
-        console.log('🎮 Oyun verileri veritabanına kaydedildi (süreler hariç)');
+        console.log('🎮 Oyun verileri veritabanına kaydedildi');
         
         // Güncel oyun verilerini al ve state'leri güncelle
         const updatedGameDoc = await getDoc(gameRef);
         if (updatedGameDoc.exists()) {
           const updatedData = updatedGameDoc.data() as Game;
           setLetterPool(updatedData.letterPool || []);
-          
-          console.log('🎮 Süre bilgileri sadece yerel olarak ayarlandı:', {
-            playerTime: playerRemainingTime,
-            opponentTime: opponentRemainingTime,
-            remainingTime
-          });
           
           setIsMyTurn(startingPlayer === userId);
           
@@ -257,10 +454,13 @@ export default function GamePlayScreen() {
     const newPlayerRack = [...playerRack];
     newPlayerRack[rackIndex] = '';
     
+    // Raftaki bir sonraki harfi bul ve seç
+    const nextRackTileIndex = newPlayerRack.findIndex(l => l !== '');
+    
     setBoard(newBoard);
     setPlayerRack(newPlayerRack);
     setSelectedTile(null);
-    setSelectedRackTile(null);
+    setSelectedRackTile(nextRackTileIndex === -1 ? null : nextRackTileIndex); // Otomatik olarak bir sonraki harfi seç
   };
   
   // Yerleştirilmiş harfi geri al
@@ -288,213 +488,403 @@ export default function GamePlayScreen() {
     setPlayerRack(newPlayerRack);
   };
   
-  // Oyun durumunu dinle
-  useEffect(() => {
-    if (!gameId) {
-      setError('Oyun bilgisi bulunamadı');
+  // Harflerin yatay veya dikey bir çizgide olup olmadığını kontrol et
+  const checkPlacementIsValid = (placedTiles: TileData[]): boolean => {
+    // Tek harf yerleştirilmişse her zaman geçerlidir
+    if (placedTiles.length === 1) return true;
+    
+    // Tüm yerleştirilen harflerin aynı satırda olup olmadığını kontrol et (yatay kontrol)
+    const allInSameRow = placedTiles.every(tile => tile.row === placedTiles[0].row);
+    
+    if (allInSameRow) {
+      // Sıralı olup olmadıklarını kontrol et
+      const cols = placedTiles.map(tile => tile.col).sort((a, b) => a - b);
+      
+      // Her sütun değerinin bir öncekinden sadece 1 fazla olmalı
+      for (let i = 1; i < cols.length; i++) {
+        if (cols[i] !== cols[i-1] + 1) {
+          // Aralarında boşluk var, ancak bu boşlukta bir harf var mı kontrol et
+          const row = placedTiles[0].row;
+          const col = cols[i-1] + 1;
+          if (col < cols[i] && board[row][col].letter === '') {
+            return false; // Aralarında boş kare var, bu geçersiz bir yerleştirme
+          }
+        }
+      }
+      return true;
+    }
+    
+    // Tüm yerleştirilen harflerin aynı sütunda olup olmadığını kontrol et (dikey kontrol)
+    const allInSameCol = placedTiles.every(tile => tile.col === placedTiles[0].col);
+    
+    if (allInSameCol) {
+      // Sıralı olup olmadıklarını kontrol et
+      const rows = placedTiles.map(tile => tile.row).sort((a, b) => a - b);
+      
+      // Her satır değerinin bir öncekinden sadece 1 fazla olmalı
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i] !== rows[i-1] + 1) {
+          // Aralarında boşluk var, ancak bu boşlukta bir harf var mı kontrol et
+          const row = rows[i-1] + 1;
+          const col = placedTiles[0].col;
+          if (row < rows[i] && board[row][col].letter === '') {
+            return false; // Aralarında boş kare var, bu geçersiz bir yerleştirme
+          }
+        }
+      }
+      return true;
+    }
+    
+    // Ne yatay ne de dikey bir çizgide değiller
+    return false;
+  };
+  
+  // Yerleştirilen harflerden oluşan kelimeleri ve toplam puanı bul
+  const findWords = (placedTiles: TileData[]): { words: TileData[][]; score: number } => {
+    let totalScore = 0;
+    const words: TileData[][] = [];
+    
+    // Tüm yerleştirilmiş harfler aynı satırda mı? (yatay kelime)
+    const allInSameRow = placedTiles.every(tile => tile.row === placedTiles[0].row);
+    
+    if (allInSameRow) {
+      // Yatay kelimeyi bul
+      const row = placedTiles[0].row;
+      const cols = placedTiles.map(tile => tile.col).sort((a, b) => a - b);
+      const minCol = cols[0];
+      const maxCol = cols[cols.length - 1];
+      
+      // Kelimeyi oluştur (yerleştirilmiş ve kalıcı harfler birlikte)
+      const horizontalWord: TileData[] = [];
+      
+      // Kelimenin başlangıcını bul (yerleştirilmiş harflerden önceki bağlantılı harfler)
+      let startCol = minCol;
+      while (startCol > 0 && board[startCol - 1][row].letter) {
+        startCol--;
+      }
+      
+      // Kelimenin sonunu bul (yerleştirilmiş harflerden sonraki bağlantılı harfler)
+      let endCol = maxCol;
+      while (endCol < 14 && board[endCol + 1][row].letter) {
+        endCol++;
+      }
+      
+      // Kelimeyi oluştur
+      for (let col = startCol; col <= endCol; col++) {
+        horizontalWord.push(board[row][col]);
+      }
+      
+      // Kelime en az 2 harften oluşmalı
+      if (horizontalWord.length >= 2) {
+        words.push(horizontalWord);
+        totalScore += calculateWordScore(horizontalWord);
+      }
+      
+      // Yerleştirilen her harften dikey kelimeler de oluşabilir
+      for (const placedTile of placedTiles) {
+        const verticalWord: TileData[] = [];
+        const { row: tileRow, col: tileCol } = placedTile;
+        
+        // Kelimenin başlangıcını bul (yukarı doğru)
+        let startRow = tileRow;
+        while (startRow > 0 && board[startRow - 1][tileCol].letter) {
+          startRow--;
+        }
+        
+        // Kelimenin sonunu bul (aşağı doğru)
+        let endRow = tileRow;
+        while (endRow < 14 && board[endRow + 1][tileCol].letter) {
+          endRow++;
+        }
+        
+        // Kelimeyi oluştur
+        for (let row = startRow; row <= endRow; row++) {
+          verticalWord.push(board[row][tileCol]);
+        }
+        
+        // Kelime en az 2 harften oluşmalı
+        if (verticalWord.length >= 2) {
+          words.push(verticalWord);
+          totalScore += calculateWordScore(verticalWord);
+        }
+      }
+    } else {
+      // Tüm yerleştirilmiş harfler aynı sütunda mı? (dikey kelime)
+      const allInSameCol = placedTiles.every(tile => tile.col === placedTiles[0].col);
+      
+      if (allInSameCol) {
+        // Dikey kelimeyi bul
+        const col = placedTiles[0].col;
+        const rows = placedTiles.map(tile => tile.row).sort((a, b) => a - b);
+        const minRow = rows[0];
+        const maxRow = rows[rows.length - 1];
+        
+        // Kelimeyi oluştur (yerleştirilmiş ve kalıcı harfler birlikte)
+        const verticalWord: TileData[] = [];
+        
+        // Kelimenin başlangıcını bul (yerleştirilmiş harflerden önceki bağlantılı harfler)
+        let startRow = minRow;
+        while (startRow > 0 && board[startRow - 1][col].letter) {
+          startRow--;
+        }
+        
+        // Kelimenin sonunu bul (yerleştirilmiş harflerden sonraki bağlantılı harfler)
+        let endRow = maxRow;
+        while (endRow < 14 && board[endRow + 1][col].letter) {
+          endRow++;
+        }
+        
+        // Kelimeyi oluştur
+        for (let row = startRow; row <= endRow; row++) {
+          verticalWord.push(board[row][col]);
+        }
+        
+        // Kelime en az 2 harften oluşmalı
+        if (verticalWord.length >= 2) {
+          words.push(verticalWord);
+          totalScore += calculateWordScore(verticalWord);
+        }
+        
+        // Yerleştirilen her harften yatay kelimeler de oluşabilir
+        for (const placedTile of placedTiles) {
+          const horizontalWord: TileData[] = [];
+          const { row: tileRow, col: tileCol } = placedTile;
+          
+          // Kelimenin başlangıcını bul (sola doğru)
+          let startCol = tileCol;
+          while (startCol > 0 && board[tileRow][startCol - 1].letter) {
+            startCol--;
+          }
+          
+          // Kelimenin sonunu bul (sağa doğru)
+          let endCol = tileCol;
+          while (endCol < 14 && board[tileRow][endCol + 1].letter) {
+            endCol++;
+          }
+          
+          // Kelimeyi oluştur
+          for (let col = startCol; col <= endCol; col++) {
+            horizontalWord.push(board[tileRow][col]);
+          }
+          
+          // Kelime en az 2 harften oluşmalı
+          if (horizontalWord.length >= 2) {
+            words.push(horizontalWord);
+            totalScore += calculateWordScore(horizontalWord);
+          }
+        }
+      }
+    }
+    
+    return { words, score: totalScore };
+  };
+  
+  // Pas geçme
+  const passMove = async () => {
+    if (!user || !gameId || !game || !isMyTurn) {
       return;
     }
     
-    console.log('🎮 Oyun verilerini dinliyoruz:', gameId);
-    
-    const unsubscribe = onSnapshot(
-      doc(db, 'games', gameId),
-      (docSnapshot) => {
-        if (docSnapshot.exists()) {
-          const gameData = docSnapshot.data() as Game;
-          console.log('🎮 Oyun verileri alındı:', {
-            status: gameData.status,
-            playerRacksExists: !!gameData.playerRacks,
-            playerRacksKeys: gameData.playerRacks ? Object.keys(gameData.playerRacks) : [],
-            letterPoolLength: gameData.letterPool?.length,
-            currentTurn: gameData.currentTurn,
-            creatorId: gameData.creator,
-            opponentId: gameData.opponent
-          });
-          
-          // Oyun nesnesini state'e kaydet
-          setGame({
-            ...gameData,
-            id: docSnapshot.id
-          });
-          
-          // Oyun durumunu kontrol et
-          if (gameData.status !== GameStatus.ACTIVE) {
-            if (gameData.status === GameStatus.COMPLETED || gameData.status === GameStatus.TIMEOUT) {
-              Alert.alert(
-                'Oyun Sona Erdi',
-                gameData.winnerId ? 'Kazanan belli oldu!' : 'Süre doldu!',
-                [
-                  { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
-                ]
-              );
-            } else {
-              setError('Bu oyun artık aktif değil');
-            }
-          } else {
-            console.log('🎮 Oyun AKTIF durumdadır, oyun başlatılabilir.');
-            
-            // Oyun aktifse ve letterPool yoksa, oyunu başlat
-            if (!gameData.letterPool || gameData.letterPool.length === 0) {
-              console.log('🎮 Oyun başlatılacak - letterPool henüz oluşturulmamış');
-              initializeGame();
-            } else {
-              console.log('🎮 Oyun zaten başlatılmış, veriler yükleniyor');
-              
-              // Kullanıcı ID'lerini al
-              if (user) {
-                const userId = (user as any).uid;
-                const isCreator = userId === gameData.creator;
-                const opponentId = isCreator ? gameData.opponent : gameData.creator;
-                
-                console.log('🎮 Oyuncu bilgileri:', {
-                  userId,
-                  isCreator,
-                  opponentId,
-                  raflarımızVar: gameData.playerRacks && gameData.playerRacks[userId]
-                });
-
-                // Sıranın kimde olduğunu güncelle (bunu öne aldık)
-                const isUserTurn = gameData.currentTurn === userId;
-                
-                // ÖNEMLİ: Tahtaya yerleştirilmiş harfler var mı kontrol et
-                // Eğer oyuncunun sırası ve tahtada yerleştirilmiş harfler varsa, tahtayı güncelleme
-                const hasPlacedTiles = board.some(row => row.some(tile => tile.isPlaced));
-                
-                // Tahtayı güncelle - ancak oyuncunun sırası ve yerleştirdiği harfler varsa güncelleme
-                if (gameData.board && !(isUserTurn && hasPlacedTiles)) {
-                  const newBoard = createEmptyBoard();
-                  Object.entries(gameData.board).forEach(([key, letter]) => {
-                    const [row, col] = key.split(',').map(Number);
-                    if (row >= 0 && row < 15 && col >= 0 && col < 15) {
-                      newBoard[row][col].letter = letter;
-                    }
-                  });
-                  setBoard(newBoard);
-                }
-                
-                // Harfleri yükle - yerleştirilmiş harfler yoksa
-                if (gameData.playerRacks && gameData.playerRacks[userId] && !(isUserTurn && hasPlacedTiles)) {
-                  console.log('🎮 Oyuncu harfleri yükleniyor:', gameData.playerRacks[userId]);
-                  setPlayerRack(gameData.playerRacks[userId]);
-                  setLetterPool(gameData.letterPool || []);
-                }
-                
-                // Puanları güncelle
-                if (gameData.scores) {
-                  setPlayerScore(gameData.scores[userId] || 0);
-                  setOpponentScore(gameData.scores[opponentId || ''] || 0);
-                }
-                
-                // Süre takibi
-                if (gameData.playerTimes) {
-                  setPlayerRemainingTime(gameData.playerTimes[userId] || 0);
-                  setOpponentRemainingTime(gameData.playerTimes[opponentId || ''] || 0);
-                }
-
-                // Sırayı güncelle - yerleştirilmiş harfler varsa ve bu kullanıcının sırası ise değiştirme
-                if (!(isUserTurn && hasPlacedTiles)) {
-                  setIsMyTurn(isUserTurn);
-                  console.log('🎮 Şu anki sıra:', {
-                    isUserTurn,
-                    currentTurnId: gameData.currentTurn
-                  });
-                }
-                
-                // Aktif oyuncunun süresini güncelle
-                if (gameData.playerTimes) {
-                  if (isUserTurn) {
-                    setRemainingTime(gameData.playerTimes[userId] || 0);
-                  } else {
-                    setRemainingTime(gameData.playerTimes[opponentId || ''] || 0);
-                  }
-                }
-              }
-            }
-          }
-          
-          setLoading(false);
-        } else {
-          setError('Oyun bulunamadı');
-          setLoading(false);
-        }
-      },
-      (error) => {
-        console.error('Oyun dinleme hatası:', error);
-        setError('Oyun bilgisi alınamadı');
-        setLoading(false);
+    try {
+      const userId = (user as any).uid;
+      const opponentId = userId === game.creator ? game.opponent : game.creator;
+      
+      if (!opponentId) {
+        throw new Error('Rakip bulunamadı');
       }
-    );
-    
-    return () => unsubscribe();
-  }, [gameId, router, user, board]);
+      
+      // Sırayı değiştir (yerel olarak)
+      setIsMyTurn(false);
+      
+      // Veritabanında sırayı güncelle
+      const gameRef = doc(db, 'games', gameId);
+      await updateDoc(gameRef, {
+        currentTurn: opponentId,
+        lastMoveAt: serverTimestamp() // Hamle zamanını güncelle
+      });
+      
+      console.log('⏭️ Pas geçildi, sıra rakibe geçti');
+      
+      Toast.show({
+        type: 'info',
+        text1: 'Pas Geçildi',
+        text2: 'Sırayı rakibe devrettiniz',
+        position: 'bottom',
+      });
+    } catch (error) {
+      console.error('Pas geçme hatası:', error);
+      Toast.show({
+        type: 'error',
+        text1: 'Hata',
+        text2: 'Pas geçme işlemi yapılamadı',
+        position: 'bottom',
+      });
+    }
+  };
   
-  // Süre dolduğunda çağrılacak fonksiyon
-  const handleTimeout = async () => {
+  // Oyundan çekilme
+  const surrenderGame = async () => {
     if (!user || !gameId || !game) return;
     
     try {
-      console.log('⏱️ Süre doldu:', {
-        oyuncu: playerRemainingTime,
-        rakip: opponentRemainingTime
+      const userId = (user as any).uid;
+      const opponentId = userId === game.creator ? game.opponent : game.creator;
+      
+      if (!opponentId) {
+        throw new Error('Rakip bulunamadı');
+      }
+      
+      const gameRef = doc(db, 'games', gameId);
+      
+      // Teslim olma durumunda oyun durumunu güncelle
+      await updateDoc(gameRef, {
+        status: GameStatus.COMPLETED,
+        endTime: serverTimestamp(),
+        winnerId: opponentId,
+        winReason: 'surrender'
       });
       
-      // Süre dolunca yerel state güncelle
-      setIsMyTurn(false);
-      
-      Toast.show({
-        type: 'error',
-        text1: 'Süre Doldu',
-        text2: 'Süreniz doldu. Hamleniz iptal edildi.',
-        position: 'bottom',
-      });
-      
-      // Sadece loglamak ve ekrana mesaj göstermek için, veri tabanı güncellenmeyecek
-      console.log('⏱️ Oyun sadece yerel olarak güncellendi: TIMEOUT');
+      console.log('🏳️ Oyundan çekildiniz. Rakip kazandı.');
       
       Alert.alert(
-        'Süre Doldu',
-        'Süreniz doldu. Oyun sona erdi.',
+        'Oyundan Çekildiniz',
+        'Oyundan çekildiniz ve rakibiniz kazandı.',
         [
           { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
         ]
       );
     } catch (error) {
-      console.error('Süre doldurma hatası:', error);
+      console.error('Oyundan çekilme hatası:', error);
+      Toast.show({
+        type: 'error',
+        text1: 'Hata',
+        text2: 'Oyundan çekilme işlemi yapılamadı',
+        position: 'bottom',
+      });
     }
   };
   
-  // Oyuncu sürelerini güncelle
-  const handleTimeUpdate = async (playerTime: number, opponentTime: number) => {
-    if (!gameId || !user || !game) return;
+  // Kalan süreyi kontrol eden timer - eğer süre bittiyse timeout yap
+  useEffect(() => {
+    let timer: NodeJS.Timeout | null = null;
     
-    try {
-      const userId = (user as any).uid;
-      
-      // Veri tabanına kaydetmeyi kaldırdık, sadece yerel state'i güncelle
-      setPlayerRemainingTime(playerTime);
-      setOpponentRemainingTime(opponentTime);
-      
-      // Debug amaçlı log
-      if (playerTime % 60 === 0 || playerTime <= 10) {
-        console.log('⏱️ Sadece yerel süre güncellendi:', {
-          oyuncu: playerTime,
-          rakip: opponentTime
-        });
-      }
-    } catch (error) {
-      console.error('Süre güncelleme hatası:', error);
+    // Sadece benim sıramsa aktif oyuncunun süresini kontrol et
+    if (isMyTurn && game?.lastMoveAt && game?.turnDuration) {
+      timer = setInterval(() => {
+        // Kalan süreyi hesapla
+        const remaining = deriveRemaining(
+          game.turnDuration,
+          game.lastMoveAt,
+          true
+        );
+        
+        // Süre bittiyse oyunu bitir
+        if (remaining <= 0) {
+          handleTimeout();
+          if (timer) clearInterval(timer);
+        }
+      }, 1000);
     }
+    
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [isMyTurn, game?.lastMoveAt, game?.turnDuration, deriveRemaining]);
+  
+  // Hamleyi iptal et
+  const cancelMove = () => {
+    if (!isMyTurn) return;
+    
+    // Bu turda yerleştirilen tüm harfleri temizle ve raftaki yerlerine geri koy
+    const newBoard = [...board];
+    const newPlayerRack = [...playerRack];
+    
+    // Yerleştirilmiş her harfi bul ve rafa geri ekle
+    board.forEach((row, rowIndex) => {
+      row.forEach((tile, colIndex) => {
+        if (tile.isPlaced) {
+          // Harfi rafa geri koy (ilk boş yere)
+          const emptyIndex = newPlayerRack.findIndex(l => l === '');
+          if (emptyIndex !== -1) {
+            newPlayerRack[emptyIndex] = tile.letter;
+          } else {
+            newPlayerRack.push(tile.letter);
+          }
+          
+          // Tahtadaki harfi temizle
+          newBoard[rowIndex][colIndex] = {
+            ...tile,
+            letter: '',
+            isPlaced: false
+          };
+        }
+      });
+    });
+    
+    setBoard(newBoard);
+    setPlayerRack(newPlayerRack);
+    setSelectedTile(null);
+    setSelectedRackTile(null);
+    
+    Toast.show({
+      type: 'info',
+      text1: 'Hamle İptal Edildi',
+      text2: 'Harfleriniz geri alındı.',
+      position: 'bottom',
+    });
+  };
+  
+  // İzin verilen karelerin belirginleştirilmesi için koşulları tanımla
+  const isAllowedSquare = (tile: TileData): boolean => {
+    // Eğer kare zaten doluysa, ona yerleştirilemez
+    if (tile.letter) return false;
+    
+    // İlk hamlede merkezi kareye (*) yerleştirme zorunluluğu
+    // Tahtada hiç kalıcı harf yoksa ilk hamledir
+    if (!hasPermanentLetter && !placedThisTurn) {
+      return tile.row === 7 && tile.col === 7;
+    }
+    
+    // Komşu kareleri kontrol et (yatay ve dikey)
+    const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]]; // üst, alt, sol, sağ
+    return dirs.some(([dr, dc]) => {
+      const r = tile.row + dr;
+      const c = tile.col + dc;
+      // Tahta sınırları içinde mi ve komşu karede bir harf var mı?
+      return r >= 0 && r < 15 && c >= 0 && c < 15 && board[r][c].letter;
+    });
+  };
+  
+  // Bir kareye tıklandığında
+  const handleTilePress = (tile: TileData) => {
+    // Eğer benim turam değilse işlem yapma
+    if (!isMyTurn) return;
+    
+    // Eğer kare boşsa ve bir raf harfi seçilmişse
+    if (tile.letter === '' && selectedRackTile !== null) {
+      placeLetterFromRack(tile, selectedRackTile);
+    } 
+    // Eğer kare doluysa ve bu tur yerleştirilmişse, harfi geri al
+    else if (tile.isPlaced) {
+      takeBackLetter(tile);
+    }
+  };
+  
+  // Raftaki bir harfe tıklandığında
+  const handleRackTilePress = (index: number) => {
+    if (!isMyTurn) return;
+    
+    // Harf yoksa işlem yapma
+    if (!playerRack[index]) return;
+    
+    setSelectedRackTile(index);
   };
   
   // Hamleyi onayla ve sırayı rakibe geçir
   const confirmMove = async () => {
     if (!user || !gameId || !game) return;
     
-    console.log('🎮 Hamle onayı başlıyor:', {
-      oyuncuSüresi: playerRemainingTime,
-      ekrandakiSüre: remainingTime
-    });
+    console.log('🎮 Hamle onayı başlıyor');
     
     // Yerleştirilen harfleri bul
     const placedTiles: TileData[] = [];
@@ -518,7 +908,7 @@ export default function GamePlayScreen() {
     }
     
     // İlk hamlede merkezi kareye yerleştirme kontrolü
-    const isFirstMove = !board.some(row => row.some(tile => tile.letter !== '' && !tile.isPlaced));
+    const isFirstMove = !hasPermanentLetter;
     const centerTile = board[7][7];
     
     if (isFirstMove && !placedTiles.some(tile => tile.row === 7 && tile.col === 7)) {
@@ -580,11 +970,25 @@ export default function GamePlayScreen() {
       return;
     }
     
-    /* 
-    // Kelime kontrolü şimdilik devre dışı
-    // TODO: Kelime geçerliliği kontrolü
-    // TODO: Puanlama hesaplaması
-    */
+    // Oluşturulan kelime(ler)i bul
+    const { words, score } = findWords(placedTiles);
+    
+    if (words.length === 0) {
+      Toast.show({
+        type: 'error',
+        text1: 'Geçersiz Hamle',
+        text2: 'Geçerli bir kelime oluşturulamadı',
+        position: 'bottom',
+      });
+      return;
+    }
+    
+    // Oyuncunun yeni puanını hesapla
+    const userId = (user as any).uid;
+    const newPlayerScore = (game.scores?.[userId] || 0) + score;
+    
+    console.log('🎮 Hamle puanı:', score);
+    console.log('🎮 Toplam yeni puan:', newPlayerScore);
     
     try {
       // Harf havuzundan yeni harfler çek
@@ -614,8 +1018,6 @@ export default function GamePlayScreen() {
         });
       });
       
-      // Kullanıcı ID'lerini al
-      const userId = (user as any).uid;
       // Rakip ID'sini al ve tip güvenliği sağla
       const opponentUserId = userId === game.creator ? game.opponent : game.creator;
       
@@ -627,24 +1029,24 @@ export default function GamePlayScreen() {
       const playerRacks: Record<string, string[]> = { ...(game.playerRacks || {}) };
       playerRacks[userId] = newPlayerRack;
       
-      console.log('🎮 Veritabanında süreler güncellenmeyecek, sadece yerel durumda tutulacak:', {
-        kullanıcıId: userId,
-        güncelSüre: playerRemainingTime
-      });
+      // Puanları güncelle
+      const updatedScores = { ...(game.scores || {}) };
+      updatedScores[userId] = newPlayerScore;
       
-      // Veritabanında güncelle - süre bilgilerini dahil etmeyelim
+      // Veritabanında güncelle
       await updateDoc(gameRef, {
         board: boardState,
         letterPool: tempLetterPool,
         playerRacks,
         currentTurn: opponentUserId,
-        lastMoveTime: Timestamp.now()
-        // playerTimes alanını kaldırdık
+        lastMoveAt: serverTimestamp(), // Hamle zamanını güncelle
+        scores: updatedScores // Puanları güncelle
       });
       
       // Yerel durumu güncelle
       setLetterPool(tempLetterPool);
       setPlayerRack(newPlayerRack);
+      setPlayerScore(newPlayerScore); // Oyuncunun puanını güncelle
       
       // Tüm yeni yerleştirilen harfleri kalıcı yap
       const newBoard = board.map(row => 
@@ -656,17 +1058,12 @@ export default function GamePlayScreen() {
       setBoard(newBoard);
       
       // Sırayı değiştir
-      console.log('🎮 Hamle tamamlandı, sıra değişiyor:', {
-        önceki: isMyTurn,
-        sonraki: false,
-        kime: opponentUserId
-      });
       setIsMyTurn(false);
       
       Toast.show({
         type: 'success',
         text1: 'Hamle Tamamlandı',
-        text2: 'Sıra rakibinize geçti',
+        text2: `${score} puan kazandınız! Sıra rakibinize geçti`,
         position: 'bottom',
       });
     } catch (error) {
@@ -678,240 +1075,6 @@ export default function GamePlayScreen() {
         position: 'bottom',
       });
     }
-  };
-  
-  // Harflerin yatay veya dikey bir çizgide olup olmadığını kontrol et
-  const checkPlacementIsValid = (placedTiles: TileData[]): boolean => {
-    // Tek harf yerleştirilmişse her zaman geçerlidir
-    if (placedTiles.length === 1) return true;
-    
-    // Tüm yerleştirilen harflerin aynı satırda olup olmadığını kontrol et (yatay kontrol)
-    const allInSameRow = placedTiles.every(tile => tile.row === placedTiles[0].row);
-    
-    if (allInSameRow) {
-      // Sıralı olup olmadıklarını kontrol et
-      const cols = placedTiles.map(tile => tile.col).sort((a, b) => a - b);
-      
-      // Her sütun değerinin bir öncekinden sadece 1 fazla olmalı
-      for (let i = 1; i < cols.length; i++) {
-        if (cols[i] !== cols[i-1] + 1) {
-          // Aralarında boşluk var, ancak bu boşlukta bir harf var mı kontrol et
-          const row = placedTiles[0].row;
-          const col = cols[i-1] + 1;
-          if (col < cols[i] && board[row][col].letter === '') {
-            return false; // Aralarında boş kare var, bu geçersiz bir yerleştirme
-          }
-        }
-      }
-      return true;
-    }
-    
-    // Tüm yerleştirilen harflerin aynı sütunda olup olmadığını kontrol et (dikey kontrol)
-    const allInSameCol = placedTiles.every(tile => tile.col === placedTiles[0].col);
-    
-    if (allInSameCol) {
-      // Sıralı olup olmadıklarını kontrol et
-      const rows = placedTiles.map(tile => tile.row).sort((a, b) => a - b);
-      
-      // Her satır değerinin bir öncekinden sadece 1 fazla olmalı
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i] !== rows[i-1] + 1) {
-          // Aralarında boşluk var, ancak bu boşlukta bir harf var mı kontrol et
-          const row = rows[i-1] + 1;
-          const col = placedTiles[0].col;
-          if (row < rows[i] && board[row][col].letter === '') {
-            return false; // Aralarında boş kare var, bu geçersiz bir yerleştirme
-          }
-        }
-      }
-      return true;
-    }
-    
-    // Ne yatay ne de dikey bir çizgide değiller
-    return false;
-  };
-  
-  // Pas geçme
-  const passMove = async () => {
-    if (!user || !gameId || !game || !isMyTurn) {
-      return;
-    }
-    
-    try {
-      const userId = (user as any).uid;
-      const opponentId = userId === game.creator ? game.opponent : game.creator;
-      
-      if (!opponentId) {
-        throw new Error('Rakip bulunamadı');
-      }
-      
-      // Sırayı değiştir (yerel olarak)
-      setIsMyTurn(false);
-      
-      // Veritabanında sadece sırayı güncelle, süre bilgilerini tutma
-      const gameRef = doc(db, 'games', gameId);
-      await updateDoc(gameRef, {
-        currentTurn: opponentId,
-        lastMoveTime: Timestamp.now()
-      });
-      
-      console.log('⏭️ Pas geçildi, sıra rakibe geçti', {
-        şimdikiOyuncu: opponentId
-      });
-      
-      Toast.show({
-        type: 'info',
-        text1: 'Pas Geçildi',
-        text2: 'Sırayı rakibe devrettiniz',
-        position: 'bottom',
-      });
-    } catch (error) {
-      console.error('Pas geçme hatası:', error);
-      Toast.show({
-        type: 'error',
-        text1: 'Hata',
-        text2: 'Pas geçme işlemi yapılamadı',
-        position: 'bottom',
-      });
-    }
-  };
-  
-  // Oyundan çekilme
-  const surrenderGame = async () => {
-    if (!user || !gameId || !game) return;
-    
-    try {
-      const userId = (user as any).uid;
-      const gameRef = doc(db, 'games', gameId);
-      
-      // Teslim olma durumunda sadece oyun durumunu güncelle
-      await updateDoc(gameRef, {
-        status: GameStatus.COMPLETED,
-        endTime: Timestamp.now(),
-        loser: userId,
-        winReason: 'surrender'
-      });
-      
-      console.log('🏳️ Oyundan çekildiniz. Rakip kazandı.');
-      
-      Alert.alert(
-        'Oyundan Çekildiniz',
-        'Oyundan çekildiniz ve rakibiniz kazandı.',
-        [
-          { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
-        ]
-      );
-    } catch (error) {
-      console.error('Oyundan çekilme hatası:', error);
-      Toast.show({
-        type: 'error',
-        text1: 'Hata',
-        text2: 'Oyundan çekilme işlemi yapılamadı',
-        position: 'bottom',
-      });
-    }
-  };
-  
-  // Hamleyi iptal et
-  const cancelMove = () => {
-    if (!isMyTurn) return;
-    
-    // Bu turda yerleştirilen tüm harfleri temizle ve raftaki yerlerine geri koy
-    const newBoard = [...board];
-    const newPlayerRack = [...playerRack];
-    
-    // Yerleştirilmiş her harfi bul ve rafa geri ekle
-    board.forEach((row, rowIndex) => {
-      row.forEach((tile, colIndex) => {
-        if (tile.isPlaced) {
-          // Harfi rafa geri koy (ilk boş yere)
-          const emptyIndex = newPlayerRack.findIndex(l => l === '');
-          if (emptyIndex !== -1) {
-            newPlayerRack[emptyIndex] = tile.letter;
-          } else {
-            newPlayerRack.push(tile.letter);
-          }
-          
-          // Tahtadaki harfi temizle
-          newBoard[rowIndex][colIndex] = {
-            ...tile,
-            letter: '',
-            isPlaced: false
-          };
-        }
-      });
-    });
-    
-    setBoard(newBoard);
-    setPlayerRack(newPlayerRack);
-    setSelectedTile(null);
-    setSelectedRackTile(null);
-    
-    Toast.show({
-      type: 'info',
-      text1: 'Hamle İptal Edildi',
-      text2: 'Harfleriniz geri alındı.',
-      position: 'bottom',
-    });
-  };
-  
-  // İzin verilen karelerin belirginleştirilmesi için koşulları tanımla
-  const isAllowedSquare = (tile: TileData): boolean => {
-    // Eğer kare zaten doluysa, ona yerleştirilemez
-    if (tile.letter !== '') return false;
-    
-    // İlk hamlede merkezi kareye (*) yerleştirme zorunluluğu
-    const isFirstMove = !board.some(row => row.some(tile => tile.letter !== '' && !tile.isPlaced));
-    if (isFirstMove) return tile.row === 7 && tile.col === 7;
-    
-    // İlk hamle değilse, mevcut harflere VEYA YENI YERLEŞTİRİLEN harflere komşu olan boş karelere izin ver
-    // Komşuları kontrol et - Üst, alt, sağ, sol
-    const neighbors = [
-      { row: tile.row - 1, col: tile.col }, // üst
-      { row: tile.row + 1, col: tile.col }, // alt
-      { row: tile.row, col: tile.col - 1 }, // sol
-      { row: tile.row, col: tile.col + 1 }, // sağ
-    ];
-    
-    // Herhangi bir komşuda önceden yerleştirilmiş VEYA bu turda yerleştirilmiş harf var mı?
-    return neighbors.some(neighbor => {
-      // Tahta dışında mı?
-      if (neighbor.row < 0 || neighbor.row >= 15 || neighbor.col < 0 || neighbor.col >= 15) {
-        return false;
-      }
-      
-      const neighborTile = board[neighbor.row][neighbor.col];
-      // Önceden yerleştirilmiş VEYA bu turda yerleştirilmiş harfler
-      return neighborTile.letter !== '' && (
-        !neighborTile.isPlaced || // Önceki turlardan kalan
-        neighborTile.isPlaced     // Bu turda yerleştirilmiş
-      );
-    });
-  };
-  
-  // Bir kareye tıklandığında
-  const handleTilePress = (tile: TileData) => {
-    // Eğer benim turam değilse işlem yapma
-    if (!isMyTurn) return;
-    
-    // Eğer kare boşsa ve bir raf harfi seçilmişse
-    if (tile.letter === '' && selectedRackTile !== null) {
-      placeLetterFromRack(tile, selectedRackTile);
-    } 
-    // Eğer kare doluysa ve bu tur yerleştirilmişse, harfi geri al
-    else if (tile.isPlaced) {
-      takeBackLetter(tile);
-    }
-  };
-  
-  // Raftaki bir harfe tıklandığında
-  const handleRackTilePress = (index: number) => {
-    if (!isMyTurn) return;
-    
-    // Harf yoksa işlem yapma
-    if (!playerRack[index]) return;
-    
-    setSelectedRackTile(index);
   };
   
   // Yükleniyor durumu

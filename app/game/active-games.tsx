@@ -5,6 +5,8 @@ import { useAuth } from '../context/auth';
 import { getActiveGames, Game, GameStatus, GameDurationType } from '../utils/gameUtils';
 import { Ionicons } from '@expo/vector-icons';
 import Toast from 'react-native-toast-message';
+import { getDoc, doc, updateDoc } from 'firebase/firestore';
+import { db } from '../firebase';
 
 export default function ActiveGamesScreen() {
   const router = useRouter();
@@ -22,6 +24,44 @@ export default function ActiveGamesScreen() {
     fetchActiveGames();
   }, [user]);
 
+  // Oyun belgesini kullanıcı adıyla güncelle
+  const updateGameWithOpponentName = async (game: Game, opponentId: string, opponentName: string) => {
+    try {
+      if (!game.id) {
+        console.warn('Oyun ID eksik, güncelleme yapılamıyor');
+        return game;
+      }
+      
+      // Oyun belgesi referansını al
+      const gameRef = doc(db, 'games', game.id);
+      
+      // Kullanıcı oyunun yaratıcısı mı yoksa rakibi mi, ona göre güncelleme yap
+      const isCreator = game.creator === (user as any).uid;
+      
+      // Güncelleme nesnesini hazırla
+      const updateData = isCreator ? 
+        { opponentName: opponentName } : 
+        { creatorName: opponentName };
+      
+      // Veritabanında güncelle
+      await updateDoc(gameRef, updateData);
+      
+      console.log(`Oyun ${game.id} güncellendi, ${isCreator ? 'rakip' : 'yaratıcı'} adı: ${opponentName}`);
+      
+      // Oyun nesnesini de güncelle
+      if (isCreator) {
+        game.opponentName = opponentName;
+      } else {
+        game.creatorName = opponentName;
+      }
+      
+      return game;
+    } catch (error) {
+      console.error('Oyun güncelleme hatası:', error);
+      return game; // Hata olsa bile orijinal oyunu döndür
+    }
+  };
+
   const fetchActiveGames = async () => {
     if (!user) return;
     
@@ -32,7 +72,40 @@ export default function ActiveGamesScreen() {
       const userId = (user as any).uid;
       const activeGames = await getActiveGames(userId);
       
-      setGames(activeGames);
+      // Aktif oyunları ayarlamadan önce, her birinin rakip adını kontrol edelim
+      const gamesWithUpdatedOpponents = await Promise.all(
+        activeGames.map(async (game) => {
+          // Oyuncunun rakip mi yoksa oluşturucu mu olduğunu kontrol et
+          const isCreator = game.creator === userId;
+          const opponentId = isCreator ? game.opponent : game.creator;
+          
+          // Eğer rakip adı yoksa veya "İsimsiz Rakip" ise, Firebase'den kullanıcı bilgisini al
+          let opponentName = isCreator ? game.opponentName : game.creatorName;
+          
+          // Opponent ID tanımlı değilse, oyunu olduğu gibi bırak
+          if (!opponentId) return game;
+          
+          if (!opponentName || opponentName === 'Anonim' || opponentName === 'İsimsiz Rakip') {
+            try {
+              // Kullanıcı belgesini al
+              const userDoc = await getDoc(doc(db, 'users', opponentId));
+              if (userDoc.exists()) {
+                const userData = userDoc.data();
+                const newOpponentName = userData.displayName || userData.username || 'İsimsiz Rakip';
+                
+                // Oyun belgesini Firebase'de güncelle
+                return await updateGameWithOpponentName(game, opponentId, newOpponentName);
+              }
+            } catch (userError) {
+              console.error('Kullanıcı bilgisi alınamadı:', userError);
+            }
+          }
+          
+          return game;
+        })
+      );
+      
+      setGames(gamesWithUpdatedOpponents);
     } catch (error) {
       console.error('Aktif oyunları getirme hatası:', error);
       setError('Aktif oyunları getirirken bir hata oluştu.');
@@ -92,7 +165,19 @@ export default function ActiveGamesScreen() {
     
     try {
       const date = timestamp.toDate();
-      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString().slice(0, 5);
+      // Günü 2 basamaklı olarak formatla
+      const day = String(date.getDate()).padStart(2, '0');
+      // Ayı 2 basamaklı olarak formatla (JavaScript'te aylar 0'dan başlar)
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      // Yılı 4 basamaklı al
+      const year = date.getFullYear();
+      // Saati 2 basamaklı formatla
+      const hours = String(date.getHours()).padStart(2, '0');
+      // Dakikayı 2 basamaklı formatla
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      
+      // GÜN/AY/YIL SAAT:DAKİKA formatında döndür
+      return `${day}/${month}/${year} ${hours}:${minutes}`;
     } catch (e) {
       return 'Geçersiz tarih';
     }
@@ -178,7 +263,7 @@ export default function ActiveGamesScreen() {
                   
                   <View style={styles.lastMoveContainer}>
                     <Text style={styles.lastMoveText}>
-                      Son hamle: {formatDate(game.lastMoveTime || game.startTime)}
+                      Son hamle: {formatDate(game.lastMoveAt || game.startTime)}
                     </Text>
                   </View>
                 </View>

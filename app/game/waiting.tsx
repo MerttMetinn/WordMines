@@ -16,6 +16,22 @@ declare global {
   }
 }
 
+// Oyun süresini kullanıcı dostu formata çevirme
+const formatDurationType = (type: GameDurationType): string => {
+  switch(type) {
+    case GameDurationType.MINUTES_2:
+      return '2 Dakika';
+    case GameDurationType.MINUTES_5:
+      return '5 Dakika';
+    case GameDurationType.HOURS_12:
+      return '12 Saat';
+    case GameDurationType.HOURS_24:
+      return '24 Saat';
+    default:
+      return 'Bilinmeyen Süre';
+  }
+};
+
 export default function WaitingScreen() {
   const router = useRouter();
   const { user } = useAuth();
@@ -130,7 +146,7 @@ export default function WaitingScreen() {
             }, 2000);
           }
           // Eğer oyun iptal edilmişse
-          else if (data.status === GameStatus.CANCELED) {
+          else if (data.status === GameStatus.ABANDONED) {
             setError('Oyun iptal edildi');
             // Temizlikleri yap
             if (intervalRef.current) {
@@ -211,7 +227,7 @@ export default function WaitingScreen() {
       <Text style={styles.title}>Rakip Aranıyor</Text>
       
       <Text style={styles.durationText}>
-        Seçilen oyun süresi: {durationType}
+        Seçilen oyun süresi: {formatDurationType(durationType)}
       </Text>
       
       <View style={styles.animationContainer}>

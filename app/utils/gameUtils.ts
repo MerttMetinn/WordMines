@@ -49,7 +49,6 @@ export interface Game {
   createdAt: any; // Timestamp
   startTime?: any; // Timestamp
   endTime?: any; // Timestamp
-  lastMoveTime?: any; // Timestamp
   durationType: GameDurationType;
   winnerId?: string;
   scores?: Record<string, number>;
@@ -58,17 +57,12 @@ export interface Game {
   letterPool?: string[];
   playerRacks?: Record<string, string[]>;
   currentTurn?: string;
-  // Oyuncu süreleri - her oyuncunun kalan süresi saniye cinsinden
-  playerTimes?: Record<string, number>;
+  turnDuration: number;       // Her hamle için saniye cinsinden süre
+  lastMoveAt?: Timestamp;     // Son hamle zamanı, serverTimestamp olarak
   winner?: string;
   loser?: string;
-  creatorRack: string[];
-  opponentRack: string[];
-  creatorScore: number;
-  opponentScore: number;
-  words: string[];
-  creatorTimeRemaining: number; // in milliseconds
-  opponentTimeRemaining: number; // in milliseconds
+  winReason?: string;
+  updatedAt?: any; // Timestamp
 }
 
 /**
@@ -92,14 +86,7 @@ export const createGame = async (
       letterPool: [],
       playerRacks: { [userId]: [] },
       currentTurn: userId,
-      playerTimes: { [userId]: getDurationInSeconds(durationType) },
-      creatorRack: [],
-      opponentRack: [],
-      creatorScore: 0,
-      opponentScore: 0,
-      words: [],
-      creatorTimeRemaining: getDurationInSeconds(durationType) * 1000,
-      opponentTimeRemaining: getDurationInSeconds(durationType) * 1000
+      turnDuration: getDurationInSeconds(durationType)
     };
     
     // Önce aynı süre seçeneğiyle bekleyen eşleşme var mı kontrol et
@@ -120,9 +107,10 @@ export const createGame = async (
       const waitingGame = waitingGamesSnapshot.docs[0];
       const waitingGameData = waitingGame.data() as Game;
       
-      // Eşleşme yap ve oyunu güncelle
+      // Eşleşme yap ve oyunu güncelle - kullanıcı adını da ekleyelim
       await updateDoc(doc(db, 'games', waitingGame.id), {
         opponent: userId,
+        opponentName: userName || 'Anonim',
         status: GameStatus.ACTIVE
       });
       
@@ -131,6 +119,7 @@ export const createGame = async (
         ...waitingGameData,
         id: waitingGame.id,
         opponent: userId,
+        opponentName: userName || 'Anonim',
         status: GameStatus.ACTIVE
       };
     }
@@ -184,8 +173,8 @@ export const getActiveGames = async (userId: string): Promise<Game[]> => {
       if (a.currentTurn !== userId && b.currentTurn === userId) return 1;
       
       // İkisi de aynı durumda ise, son hamle zamanına göre sırala (en yeni üstte)
-      const aTime = a.lastMoveTime || a.startTime;
-      const bTime = b.lastMoveTime || b.startTime;
+      const aTime = a.lastMoveAt || a.startTime;
+      const bTime = b.lastMoveAt || b.startTime;
       
       return bTime.toMillis() - aTime.toMillis();
     });
@@ -355,8 +344,12 @@ export const cancelGame = async (gameId: string, userId: string): Promise<boolea
     }
     
     // Eğer sıra bu kullanıcıdaysa ve süre dolduysa, kullanıcı kaybeder
-    if (gameData.playerTimes && gameData.currentTurn && gameData.playerTimes[gameData.currentTurn] <= 0) {
-      if (gameData.opponent) {
+    if (gameData.turnDuration && gameData.lastMoveAt && gameData.currentTurn) {
+      // Geçen süreyi hesapla (şu anki zaman - son hamle zamanı)
+      const elapsedSeconds = (Timestamp.now().toMillis() - gameData.lastMoveAt.toMillis()) / 1000;
+      
+      // Eğer geçen süre hamle süresini aştıysa, sıradaki oyuncu kaybeder
+      if (elapsedSeconds > gameData.turnDuration && gameData.opponent) {
         const winner = gameData.opponent;
         const loser = gameData.currentTurn;
         
