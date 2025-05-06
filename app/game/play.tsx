@@ -17,7 +17,7 @@ import { useAuth } from '../context/auth';
 import { Game, GameStatus, getDurationInSeconds } from '../utils/gameUtils';
 import Toast from 'react-native-toast-message';
 import { Timestamp } from 'firebase/firestore';
-import { loadTurkishWordList } from '../utils/wordValidator';
+import { loadTurkishWordList, isValidWord, normalizeWord } from '../utils/wordValidator';
 
 // Bileşenler
 import Board from '../components/game/Board';
@@ -25,8 +25,8 @@ import Rack from '../components/game/Rack';
 import GameControls from '../components/game/GameControls';
 
 // Yardımcılar
-import { createEmptyBoard, shuffleArray, calculateWordScore } from '../utils/gameHelpers';
-import { TileData, LETTER_COUNTS } from '../utils/gameConstants';
+import { createEmptyBoard, shuffleArray, calculateWordScore, placeMines, calculateScoreWithMines } from '../utils/gameHelpers';
+import { TileData, LETTER_COUNTS, MineData, MineType } from '../utils/gameConstants';
 
 export default function GamePlayScreen() {
   const router = useRouter();
@@ -52,6 +52,9 @@ export default function GamePlayScreen() {
   const [playerRack, setPlayerRack] = useState<string[]>([]);
   // Oyun havuzundaki kalan harfler
   const [letterPool, setLetterPool] = useState<string[]>([]);
+  
+  // Mayınlar
+  const [mines, setMines] = useState<Map<string, MineData>>(new Map());
   
   // Zamanlayıcı için referans
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -100,6 +103,11 @@ export default function GamePlayScreen() {
         const loaded = await loadTurkishWordList();
         if (loaded) {
           console.log('📝 Kelime listesi başarıyla yüklendi!');
+          // Temel kelimeleri test et
+          const testWords = ['kin', 'kın', 'ev', 'su', 'göz'];
+          testWords.forEach(word => {
+            console.log(`📝 Test kelimesi "${word}" geçerli mi:`, isValidWord(word));
+          });
         } else {
           Toast.show({
             type: 'error',
@@ -154,6 +162,13 @@ export default function GamePlayScreen() {
             id: docSnapshot.id
           });
           
+          // Log oyun verileri
+          console.log('🎮 Oyun verileri yüklendi:', {
+            turnSirasi: gameData.currentTurn,
+            sonPasGecen: gameData.lastPassedBy || 'Yok',
+            status: gameData.status
+          });
+          
           // Oyun durumunu kontrol et
           if (gameData.status !== GameStatus.ACTIVE) {
             if (gameData.status === GameStatus.COMPLETED || gameData.status === GameStatus.TIMEOUT) {
@@ -170,11 +185,18 @@ export default function GamePlayScreen() {
             return; // Durumla ilgili işlem yaptık, devam etmeye gerek yok
           }
           
-          // Oyun aktifse ve letterPool yoksa, oyunu başlat
-          if (!gameData.letterPool || gameData.letterPool.length === 0) {
-            console.log('🎮 Oyun başlatılacak - letterPool henüz oluşturulmamış');
-            initializeGame();
-            return; // Oyun başlatıldı, devam etmeye gerek yok
+          // Oyun aktifse ve letterPool yoksa veya boşsa, sadece oluşturucu veya oluşturucu yoksa ilk rakip başlatsın
+          if ((!gameData.letterPool || gameData.letterPool.length === 0) && user) {
+            const userId = (user as any).uid;
+            
+            // Sadece oluşturucu (creator) veya oluşturucu yoksa rakip başlatsın
+            if (userId === gameData.creator || (gameData.opponent === userId && !gameData.creator)) {
+              console.log('🎮 Oyun başlatılacak - letterPool henüz oluşturulmamış');
+              initializeGame();
+              return; // Oyun başlatıldı, devam etmeye gerek yok
+            } else {
+              console.log('🎮 Oyun başlatması için diğer oyuncu bekleniyor');
+            }
           }
           
           // Kullanıcı harflerini yerleştirdi mi kontrol et
@@ -190,7 +212,7 @@ export default function GamePlayScreen() {
             // Sıranın kimde olduğunu kontrol et
             const isUserTurn = gameData.currentTurn === userId;
                   
-            // Tahtayı güncelle - ancak oyuncunun sırası ve yerleştirdiği harfler varsa güncelleme
+            // Tahtayı güncelle - ancak oyuncunun sırası ve yerleştirilmiş harfler varsa güncelleme
             if (gameData.board && !(isUserTurn && placedTilesRef.current)) {
               const newBoard = createEmptyBoard();
               Object.entries(gameData.board).forEach(([key, letter]) => {
@@ -355,6 +377,26 @@ export default function GamePlayScreen() {
         player2Harfleri: player2Rack
       });
       
+      // Mayınları yerleştir
+      const gameMines = placeMines();
+      setMines(gameMines);
+      
+      console.log('🎮 Mayınlar yerleştirildi, map boyutu:', gameMines.size);
+      console.log('Oluşturulan mayınlar:', Array.from(gameMines.entries()));
+      
+      // Mayınları JSON formatına dönüştür
+      const minesJson: Record<string, { type: MineType, isActive: boolean, isRevealed: boolean }> = {};
+      gameMines.forEach((mine, position) => {
+        minesJson[position] = {
+          type: mine.type,
+          isActive: mine.isActive,
+          isRevealed: mine.isRevealed
+        };
+        console.log(`Mayın JSON'a ekleniyor: pozisyon=${position}, tip=${mine.type}`);
+      });
+      
+      console.log('JSON formatında mayınlar:', JSON.stringify(minesJson));
+      
       // Oyun nesnesini güncelle
       const gameRef = doc(db, 'games', gameId);
       const gameDoc = await getDoc(gameRef);
@@ -405,7 +447,10 @@ export default function GamePlayScreen() {
           lastMoveAt: serverTimestamp(), // Oyun başlangıç zamanı
           turnDuration: gameTimeSeconds, // Her hamle için süre sınırı
           scores,
-          board: {}  // Boş tahta
+          board: {},  // Boş tahta
+          lastPassedBy: null, // İlk başlangıçta pas geçen kimse olmadığını belirt
+          consecutivePassCount: 0, // Arka arkaya pas geçme sayacı sıfırla
+          mines: minesJson // Mayınları ekle
         });
         
         console.log('🎮 Oyun verileri veritabanına kaydedildi');
@@ -539,10 +584,48 @@ export default function GamePlayScreen() {
     return false;
   };
   
+  // Yerel olarak, kelimenin geçerli olup olmadığını kontrol et
+  const isWordValid = (tiles: TileData[]): boolean => {
+    const word = tiles.map(tile => tile.letter).join('');
+    
+    // Kelimeyi ve harflerini loglayalım
+    console.log(`\n🔍 Kelime kontrolü: '${word}'`);
+    console.log(`🔍 Harfler ve kodları:`, Array.from(word).map(c => ({ char: c, code: c.charCodeAt(0) })));
+    
+    // Tanınan kelimeler için manuel kontrol ekleyelim
+    const manualValidWords = ["kin", "kın", "KİN", "KIN", "Kin", "KİN"];
+    
+    // Manuel olarak tanınması gereken kelimeler
+    if (word.toLowerCase() === "kin" || 
+        normalizeWord(word) === "kin" ||
+        manualValidWords.includes(word)) {
+      console.log(`🔍 '${word}' kelimesi manuel olarak geçerli kabul edildi!`);
+      return true;
+    }
+    
+    // Normal doğrulama
+    const isValid = isValidWord(word);
+    console.log(`🔍 '${word}' kelimesi ${isValid ? 'geçerli ✅' : 'geçersiz ❌'}`);
+    return isValid;
+  };
+  
   // Yerleştirilen harflerden oluşan kelimeleri ve toplam puanı bul
-  const findWords = (placedTiles: TileData[]): { words: TileData[][]; score: number } => {
+  const findWords = (placedTiles: TileData[]): { words: TileData[][]; score: number; } => {
     let totalScore = 0;
     const words: TileData[][] = [];
+    const validWords: TileData[][] = [];
+    
+    // Mayın kontrolü yapıp, bonus engelleyici olup olmadığını kontrol et
+    const hasBonusBlocker = (tiles: TileData[]): boolean => {
+      for (const tile of tiles) {
+        const position = `${tile.row},${tile.col}`;
+        const mine = mines.get(position);
+        if (mine && mine.isActive && mine.type === MineType.BONUS_BLOCKER) {
+          return true;
+        }
+      }
+      return false;
+    };
     
     // Tüm yerleştirilmiş harfler aynı satırda mı? (yatay kelime)
     const allInSameRow = placedTiles.every(tile => tile.row === placedTiles[0].row);
@@ -559,13 +642,13 @@ export default function GamePlayScreen() {
       
       // Kelimenin başlangıcını bul (yerleştirilmiş harflerden önceki bağlantılı harfler)
       let startCol = minCol;
-      while (startCol > 0 && board[startCol - 1][row].letter) {
+      while (startCol > 0 && board[row][startCol - 1].letter) {
         startCol--;
       }
       
       // Kelimenin sonunu bul (yerleştirilmiş harflerden sonraki bağlantılı harfler)
       let endCol = maxCol;
-      while (endCol < 14 && board[endCol + 1][row].letter) {
+      while (endCol < 14 && board[row][endCol + 1].letter) {
         endCol++;
       }
       
@@ -576,8 +659,17 @@ export default function GamePlayScreen() {
       
       // Kelime en az 2 harften oluşmalı
       if (horizontalWord.length >= 2) {
+        // Kelimeyi geçerli kelimeler listesine ekle
         words.push(horizontalWord);
-        totalScore += calculateWordScore(horizontalWord);
+        
+        // Kelimenin geçerli olup olmadığını kontrol et
+        if (isWordValid(horizontalWord)) {
+          validWords.push(horizontalWord);
+          
+          // Bonus engelleyici var mı kontrol et
+          const bonusBlocked = hasBonusBlocker(horizontalWord);
+          totalScore += calculateWordScore(horizontalWord, bonusBlocked);
+        }
       }
       
       // Yerleştirilen her harften dikey kelimeler de oluşabilir
@@ -604,8 +696,17 @@ export default function GamePlayScreen() {
         
         // Kelime en az 2 harften oluşmalı
         if (verticalWord.length >= 2) {
+          // Kelimeyi geçerli kelimeler listesine ekle
           words.push(verticalWord);
-          totalScore += calculateWordScore(verticalWord);
+          
+          // Kelimenin geçerli olup olmadığını kontrol et
+          if (isWordValid(verticalWord)) {
+            validWords.push(verticalWord);
+            
+            // Bonus engelleyici var mı kontrol et
+            const bonusBlocked = hasBonusBlocker(verticalWord);
+            totalScore += calculateWordScore(verticalWord, bonusBlocked);
+          }
         }
       }
     } else {
@@ -641,8 +742,17 @@ export default function GamePlayScreen() {
         
         // Kelime en az 2 harften oluşmalı
         if (verticalWord.length >= 2) {
+          // Kelimeyi geçerli kelimeler listesine ekle
           words.push(verticalWord);
-          totalScore += calculateWordScore(verticalWord);
+          
+          // Kelimenin geçerli olup olmadığını kontrol et
+          if (isWordValid(verticalWord)) {
+            validWords.push(verticalWord);
+            
+            // Bonus engelleyici var mı kontrol et
+            const bonusBlocked = hasBonusBlocker(verticalWord);
+            totalScore += calculateWordScore(verticalWord, bonusBlocked);
+          }
         }
         
         // Yerleştirilen her harften yatay kelimeler de oluşabilir
@@ -669,8 +779,17 @@ export default function GamePlayScreen() {
           
           // Kelime en az 2 harften oluşmalı
           if (horizontalWord.length >= 2) {
+            // Kelimeyi geçerli kelimeler listesine ekle
             words.push(horizontalWord);
-            totalScore += calculateWordScore(horizontalWord);
+            
+            // Kelimenin geçerli olup olmadığını kontrol et
+            if (isWordValid(horizontalWord)) {
+              validWords.push(horizontalWord);
+              
+              // Bonus engelleyici var mı kontrol et
+              const bonusBlocked = hasBonusBlocker(horizontalWord);
+              totalScore += calculateWordScore(horizontalWord, bonusBlocked);
+            }
           }
         }
       }
@@ -682,12 +801,21 @@ export default function GamePlayScreen() {
   // Pas geçme
   const passMove = async () => {
     if (!user || !gameId || !game || !isMyTurn) {
+      console.log('🎮 Pas geçme başarısız - Kullanıcı, oyun ID, oyun verisi eksik veya sıra bizde değil');
       return;
     }
     
     try {
       const userId = (user as any).uid;
       const opponentId = userId === game.creator ? game.opponent : game.creator;
+      
+      console.log('🎮 Pas geçme işlemi başladı:', {
+        oyuncuId: userId,
+        rakipId: opponentId,
+        oyunId: gameId,
+        sonPasGecen: game.lastPassedBy || 'Hiç pas geçilmemiş',
+        ardArda: game.consecutivePassCount || 0
+      });
       
       if (!opponentId) {
         throw new Error('Rakip bulunamadı');
@@ -696,12 +824,63 @@ export default function GamePlayScreen() {
       // Sırayı değiştir (yerel olarak)
       setIsMyTurn(false);
       
-      // Veritabanında sırayı güncelle
       const gameRef = doc(db, 'games', gameId);
-      await updateDoc(gameRef, {
+      
+      // Arka arkaya pas geçme sayacını kontrol et
+      const currentPassCount = game.consecutivePassCount || 0;
+      
+      // Eğer pas geçme sayacı 2 ise (yani bu 3. pas geçme), oyunu bitir
+      if (currentPassCount === 2) {
+        console.log('🎮 Arka arkaya 3 pas geçildi, oyun bitiyor');
+        
+        // Puanları kontrol et, kim kazandı?
+        const userScore = game.scores?.[userId] || 0;
+        const opponentScore = game.scores?.[opponentId] || 0;
+        const winnerId = userScore > opponentScore ? userId : opponentId;
+        
+        // Eğer puanlar eşitse, rakip kazansın (pas geçen son oyuncu kaybeder)
+        const finalWinnerId = userScore === opponentScore ? opponentId : winnerId;
+        
+        // Oyun bitti, kazanan belirle
+        await updateDoc(gameRef, {
+          status: GameStatus.COMPLETED,
+          endTime: serverTimestamp(),
+          winnerId: finalWinnerId,
+          winReason: 'consecutive_pass',
+          lastPassedBy: userId,
+          lastMoveAt: serverTimestamp(),
+          consecutivePassCount: currentPassCount + 1
+        });
+        
+        Toast.show({
+          type: 'info',
+          text1: 'Oyun Sona Erdi',
+          text2: 'Arka arkaya 3 kez pas geçildiği için oyun bitti.',
+          position: 'bottom',
+        });
+        
+        Alert.alert(
+          'Oyun Sona Erdi',
+          `Arka arkaya 3 kez pas geçildiği için oyun sona erdi. ${finalWinnerId === userId ? 'Siz kazandınız!' : 'Rakibiniz kazandı!'}`,
+          [
+            { text: 'Ana Sayfaya Dön', onPress: () => router.replace('/dashboard') }
+          ]
+        );
+        
+        return; // İşlemi sonlandır
+      }
+      
+      // Normal pas geçme işlemi - pas geçme sayacını artır
+      const updateData = {
         currentTurn: opponentId,
-        lastMoveAt: serverTimestamp() // Hamle zamanını güncelle
-      });
+        lastMoveAt: serverTimestamp(),
+        lastPassedBy: userId, // Son pas geçen oyuncu bilgisini kaydet
+        consecutivePassCount: currentPassCount + 1 // Pas geçme sayacını artır
+      };
+      
+      console.log('🎮 Pas geçme verisi güncelleniyor:', updateData);
+      
+      await updateDoc(gameRef, updateData);
       
       console.log('⏭️ Pas geçildi, sıra rakibe geçti');
       
@@ -900,182 +1079,305 @@ export default function GamePlayScreen() {
     if (placedTiles.length === 0) {
       Toast.show({
         type: 'error',
-        text1: 'Geçersiz Hamle',
-        text2: 'Lütfen en az bir harf yerleştirin veya Pas Geç butonunu kullanın',
+        text1: 'Hamle Yapılmadı',
+        text2: 'Lütfen önce bir harf yerleştirin.',
         position: 'bottom',
       });
       return;
     }
     
-    // İlk hamlede merkezi kareye yerleştirme kontrolü
-    const isFirstMove = !hasPermanentLetter;
-    const centerTile = board[7][7];
-    
-    if (isFirstMove && !placedTiles.some(tile => tile.row === 7 && tile.col === 7)) {
+    // Yerleştirilen harflerin doğru konumda olup olmadığını kontrol et
+    if (!checkPlacementIsValid(placedTiles)) {
       Toast.show({
         type: 'error',
         text1: 'Geçersiz Hamle',
-        text2: 'İlk hamle merkezdeki yıldızlı kareye yerleştirilmelidir',
+        text2: 'Harfler yatay veya dikey bir çizgide sıralı olmalı.',
         position: 'bottom',
       });
       return;
     }
     
-    // İlk hamle değilse, yerleştirilen harflerin en az birinin mevcut harflere komşu olması gerekir
-    if (!isFirstMove) {
-      // Harflerin yerleştirildiği yerlerin etrafında zaten yerleştirilmiş harf var mı kontrol et
-      const isConnectedToExistingTile = placedTiles.some(placedTile => {
-        const { row, col } = placedTile;
-        
-        // Üst, alt, sağ, sol komşuları kontrol et
-        const neighbors = [
-          { row: row - 1, col }, // üst
-          { row: row + 1, col }, // alt
-          { row, col: col - 1 }, // sol
-          { row, col: col + 1 }, // sağ
-        ];
-        
-        // Herhangi bir komşuda önceden yerleştirilmiş harf var mı?
-        return neighbors.some(neighbor => {
-          // Tahta dışında mı?
-          if (neighbor.row < 0 || neighbor.row >= 15 || neighbor.col < 0 || neighbor.col >= 15) {
-            return false;
-          }
-          
-          const neighborTile = board[neighbor.row][neighbor.col];
-          return neighborTile.letter !== '' && !neighborTile.isPlaced;
-        });
-      });
+    try {
+      const userId = (user as any).uid;
+      const opponentId = userId === game.creator ? game.opponent : game.creator;
       
-      if (!isConnectedToExistingTile) {
+      if (!opponentId) {
+        throw new Error('Rakip bulunamadı');
+      }
+      
+      // Tüm kelimeleri bul ve puanları hesapla
+      const { words, score } = findWords(placedTiles);
+      
+      // Yeni kelimeleri biçimlendir (log için)
+      const formattedWords = words.map(wordTiles => 
+        wordTiles.map(tile => tile.letter).join('')
+      ).join(', ');
+      
+      console.log(`🔤 Oluşturulan kelimeler: ${formattedWords}`);
+      console.log(`🎯 Kazanılan puan: ${score}`);
+      
+      // Eğer puan 0 ise, geçerli kelime oluşturulmamış demektir
+      if (score === 0) {
+        console.log('❌ Geçerli bir kelime oluşturulmadı');
         Toast.show({
           type: 'error',
-          text1: 'Geçersiz Hamle',
-          text2: 'Yerleştirilen harfler tahtadaki mevcut harflerden en az birine komşu olmalıdır',
+          text1: 'Geçersiz Kelime',
+          text2: 'Yerleştirilen harflerle geçerli bir kelime oluşturulamadı.',
           position: 'bottom',
         });
         return;
       }
-    }
-    
-    // Yerleştirilen harflerin düzgün yerleşip yerleşmediğini kontrol et (yatay veya dikey olmalı)
-    const isPlacementValid = checkPlacementIsValid(placedTiles);
-    if (!isPlacementValid) {
-      Toast.show({
-        type: 'error',
-        text1: 'Geçersiz Yerleştirme',
-        text2: 'Harfler yatay veya dikey bir sıra oluşturmalıdır',
-        position: 'bottom',
-      });
-      return;
-    }
-    
-    // Oluşturulan kelime(ler)i bul
-    const { words, score } = findWords(placedTiles);
-    
-    if (words.length === 0) {
-      Toast.show({
-        type: 'error',
-        text1: 'Geçersiz Hamle',
-        text2: 'Geçerli bir kelime oluşturulamadı',
-        position: 'bottom',
-      });
-      return;
-    }
-    
-    // Oyuncunun yeni puanını hesapla
-    const userId = (user as any).uid;
-    const newPlayerScore = (game.scores?.[userId] || 0) + score;
-    
-    console.log('🎮 Hamle puanı:', score);
-    console.log('🎮 Toplam yeni puan:', newPlayerScore);
-    
-    try {
-      // Harf havuzundan yeni harfler çek
-      const newPlayerRack = [...playerRack];
-      let tempLetterPool = [...letterPool];
       
-      // Boş yerleri doldur
-      for (let i = 0; i < newPlayerRack.length; i++) {
-        if (newPlayerRack[i] === '' && tempLetterPool.length > 0) {
+      // Rack'ta kalan harfleri belirle
+      const remainingRack = [...playerRack];
+      
+      // Havuzdan yeni harfler çek
+      const newLetters: string[] = [];
+      const newPool = [...letterPool];
+      
+      // Her yerleştirilen harf için rack'tan kaldır
+      placedTiles.forEach(tile => {
+        const index = remainingRack.indexOf(tile.letter);
+        if (index !== -1) {
+          remainingRack[index] = '';
+        }
+      });
+      
+      // Boş slotları yeni harflerle doldur
+      for (let i = 0; i < remainingRack.length; i++) {
+        if (remainingRack[i] === '' && newPool.length > 0) {
           // Havuzdan rastgele bir harf al
-          const randomIndex = Math.floor(Math.random() * tempLetterPool.length);
-          newPlayerRack[i] = tempLetterPool[randomIndex];
-          tempLetterPool.splice(randomIndex, 1);
+          const randomIndex = Math.floor(Math.random() * newPool.length);
+          const newLetter = newPool.splice(randomIndex, 1)[0];
+          remainingRack[i] = newLetter;
+          newLetters.push(newLetter);
         }
       }
       
-      // Oyun verisini güncelle
-      const gameRef = doc(db, 'games', gameId);
+      console.log(`🎲 Çekilen yeni harfler: ${newLetters.join(', ')}`);
       
-      // Tahta durumunu kaydet
-      const boardState: Record<string, string> = {};
+      // Mayınlara göre puan hesapla - Tüm geçerli kelimeler için kontrol et
+      let finalScore = score;
+      let transferScore = 0;
+      const activatedMines: MineData[] = [];
+      
+      // Her geçerli kelime için mayın kontrolü ve puan hesaplaması yap
+      for (const wordTiles of words) {
+        if (isWordValid(wordTiles)) {
+          const wordScore = calculateWordScore(wordTiles);
+          const mineResult = calculateScoreWithMines(wordScore, wordTiles, mines);
+          
+          // Puanı güncelle
+          if (mineResult.activatedMines.length > 0) {
+            finalScore = mineResult.score;
+            transferScore = mineResult.transferScore;
+            activatedMines.push(...mineResult.activatedMines);
+            
+            // Mayın aktivasyonunu bildir
+            Toast.show({
+              type: 'info',
+              text1: 'Mayın Aktif!',
+              text2: mineResult.transferScore > 0 
+                ? 'Puanlarınız rakibe transfer edildi!' 
+                : mineResult.letterLossActive
+                  ? 'Elinizdeki tüm harfler değiştirilecek!'
+                  : mineResult.bonusBlockerActive
+                    ? 'Harf ve kelime katları engellenecek!'
+                    : mineResult.wordCancelActive
+                      ? 'Kelime geçersiz sayıldı, puan alamadınız!'
+                      : 'Puanlarınızın %30\'unu alabildiniz!',
+              position: 'bottom',
+            });
+            
+            // Harf kaybı mayını işle
+            if (mineResult.letterLossActive) {
+              // Kalan tüm harfleri havuza geri koy
+              remainingRack.forEach(letter => {
+                if (letter) {
+                  newPool.push(letter);
+                }
+              });
+              
+              // Boş bir raf oluştur
+              for (let i = 0; i < remainingRack.length; i++) {
+                remainingRack[i] = '';
+              }
+              
+              // Yeni harfler çek
+              for (let i = 0; i < 7; i++) {
+                if (newPool.length > 0) {
+                  // Havuzdan rastgele bir harf al
+                  const randomIndex = Math.floor(Math.random() * newPool.length);
+                  const newLetter = newPool.splice(randomIndex, 1)[0];
+                  remainingRack[i] = newLetter;
+                  newLetters.push(newLetter);
+                }
+              }
+              
+              console.log(`🔄 Harf kaybı mayını: Tüm harfler değiştirildi. Yeni harfler: ${newLetters.join(', ')}`);
+            }
+            
+            break; // İlk mayın etkisini uygula ve çık (oyunu basit tutmak için)
+          }
+        }
+      }
+      
+      // Önceki puanları al
+      const prevUserScore = game.scores?.[userId] || 0;
+      const prevOpponentScore = game.scores?.[opponentId] || 0;
+      
+      // Yeni puanları hesapla (mayın etkilerine göre)
+      const newUserScore = prevUserScore + finalScore;
+      const newOpponentScore = prevOpponentScore + transferScore;
+      
+      // Mayınları güncelle
+      const updatedMines = new Map(mines);
+      activatedMines.forEach(mine => {
+        const position = `${mine.row},${mine.col}`;
+        // Mayını pasif yap
+        if (updatedMines.has(position)) {
+          const updatedMine = { ...updatedMines.get(position)!, isActive: false };
+          updatedMines.set(position, updatedMine);
+        }
+      });
+      
+      // Mayınları JSON'a dönüştür
+      const minesJson: Record<string, { type: MineType, isActive: boolean, isRevealed: boolean }> = {};
+      updatedMines.forEach((mine, position) => {
+        minesJson[position] = {
+          type: mine.type,
+          isActive: mine.isActive,
+          isRevealed: mine.isRevealed
+        };
+      });
+      
+      // Veritabanı güncellemesi için dönüştürülmüş tahta
+      const boardData: Record<string, string> = {};
+      
+      // Tahtadaki tüm harfleri ekle
       board.forEach(row => {
         row.forEach(tile => {
           if (tile.letter) {
-            boardState[`${tile.row},${tile.col}`] = tile.letter;
+            boardData[`${tile.row},${tile.col}`] = tile.letter;
           }
         });
       });
       
-      // Rakip ID'sini al ve tip güvenliği sağla
-      const opponentUserId = userId === game.creator ? game.opponent : game.creator;
+      // Veritabanında güncellemeleri yap
+      const gameRef = doc(db, 'games', gameId);
       
-      // Kontrol et: opponentUserId tanımlı mı?
-      if (!opponentUserId) {
-        throw new Error('Rakip bilgisi bulunamadı');
-      }
-      
-      const playerRacks: Record<string, string[]> = { ...(game.playerRacks || {}) };
-      playerRacks[userId] = newPlayerRack;
-      
-      // Puanları güncelle
-      const updatedScores = { ...(game.scores || {}) };
-      updatedScores[userId] = newPlayerScore;
-      
-      // Veritabanında güncelle
       await updateDoc(gameRef, {
-        board: boardState,
-        letterPool: tempLetterPool,
-        playerRacks,
-        currentTurn: opponentUserId,
-        lastMoveAt: serverTimestamp(), // Hamle zamanını güncelle
-        scores: updatedScores // Puanları güncelle
+        board: boardData,
+        letterPool: newPool,
+        [`playerRacks.${userId}`]: remainingRack,
+        [`scores.${userId}`]: newUserScore,
+        [`scores.${opponentId}`]: newOpponentScore,
+        currentTurn: opponentId,
+        lastMoveAt: serverTimestamp(),
+        lastPassedBy: null, // Hamle yapıldığında pas geçme durumu sıfırlanır
+        consecutivePassCount: 0, // Hamle yapıldığında arka arkaya pas geçme sayacı sıfırlanır
+        mines: minesJson // Güncellenen mayınları kaydet
       });
       
-      // Yerel durumu güncelle
-      setLetterPool(tempLetterPool);
-      setPlayerRack(newPlayerRack);
-      setPlayerScore(newPlayerScore); // Oyuncunun puanını güncelle
+      // Tahtadaki harflerin yerleştirildi bilgisini kaldır
+      const updatedBoard = [...board];
+      updatedBoard.forEach(row => {
+        row.forEach(tile => {
+          if (tile.isPlaced) {
+            tile.isPlaced = false;
+          }
+        });
+      });
       
-      // Tüm yeni yerleştirilen harfleri kalıcı yap
-      const newBoard = board.map(row => 
-        row.map(tile => 
-          tile.isPlaced ? { ...tile, isPlaced: false } : tile
-        )
-      );
-      
-      setBoard(newBoard);
-      
-      // Sırayı değiştir
+      // Yereldeki durum değişkenlerini güncelle
+      setBoard(updatedBoard);
+      setPlayerRack(remainingRack);
+      setLetterPool(newPool);
       setIsMyTurn(false);
+      setSelectedTile(null);
+      setSelectedRackTile(null);
+      setPlayerScore(newUserScore);
+      setOpponentScore(newOpponentScore);
+      setMines(updatedMines);
+      
+      // Hamle tamamlandı bildirimi
+      let scoreMessage = `${finalScore} puan kazandınız.`;
+      if (transferScore > 0) {
+        scoreMessage = `${transferScore} puan rakibinize transfer edildi!`;
+      } else if (finalScore < score && activatedMines.some(mine => mine.type === MineType.POINT_DIVISION)) {
+        scoreMessage = `Mayın etkisiyle ${finalScore} puan kazandınız.`;
+      } else if (activatedMines.some(mine => mine.type === MineType.LETTER_LOSS)) {
+        scoreMessage = `${finalScore} puan kazandınız ve harfleriniz yenilendi.`;
+      } else if (activatedMines.some(mine => mine.type === MineType.BONUS_BLOCKER)) {
+        scoreMessage = `${finalScore} puan kazandınız (harf ve kelime katları olmadan).`;
+      } else if (activatedMines.some(mine => mine.type === MineType.WORD_CANCEL)) {
+        scoreMessage = 'Kelime geçersiz sayıldı, puan alamadınız.';
+      }
       
       Toast.show({
         type: 'success',
         text1: 'Hamle Tamamlandı',
-        text2: `${score} puan kazandınız! Sıra rakibinize geçti`,
+        text2: scoreMessage + ' Sıra rakibinizde.',
         position: 'bottom',
       });
+      
+      // Hamle kaydını sıfırla
+      placedTilesRef.current = false;
     } catch (error) {
-      console.error('Hamle gönderme hatası:', error);
+      console.error('Hamle onaylama hatası:', error);
       Toast.show({
         type: 'error',
-        text1: 'Hamle Hatası',
-        text2: 'Hamleniz kaydedilemedi. Lütfen tekrar deneyin.',
+        text1: 'Hata',
+        text2: 'Hamle onaylanırken bir hata oluştu.',
         position: 'bottom',
       });
     }
   };
+  
+  // Mayınları Firebase'den al ve yerel state'e yükle
+  useEffect(() => {
+    console.log('Mayın yükleme useEffect çalıştı');
+    
+    if (game?.mines) {
+      console.log('Firebase\'den alınan mayın verileri:', JSON.stringify(game.mines));
+      
+      if (Object.keys(game.mines).length > 0) {
+        const loadedMines = new Map<string, MineData>();
+        
+        Object.entries(game.mines).forEach(([position, data]) => {
+          console.log(`Mayın verisi işleniyor: pozisyon=${position}, veri=`, data);
+          const [row, col] = position.split(',').map(Number);
+          
+          // data içinde doğru alanlar var mı kontrol et
+          if (data && typeof data === 'object' && 'type' in data && 'isActive' in data && 'isRevealed' in data) {
+            loadedMines.set(position, {
+              // as MineType kullanarak tip güvenliği sağla
+              type: data.type as MineType,
+              row,
+              col,
+              isActive: Boolean(data.isActive),
+              isRevealed: Boolean(data.isRevealed)
+            });
+            console.log(`Mayın ${position} yüklendi: tip=${data.type}, aktif=${data.isActive}, görünür=${data.isRevealed}`);
+          } else {
+            console.warn(`Geçersiz mayın verisi: ${position}`, data);
+          }
+        });
+        
+        if (loadedMines.size > 0) {
+          setMines(loadedMines);
+          console.log(`🎮 ${loadedMines.size} mayın başarıyla yüklendi`);
+          console.log('Mines Map içeriği:', Array.from(loadedMines.entries()));
+        } else {
+          console.warn('Geçerli mayın verisi bulunamadı');
+        }
+      } else {
+        console.log('Oyunda mayın yok veya mayın verisi boş');
+      }
+    } else {
+      console.log('Oyun nesnesi veya mines alanı yok');
+    }
+  }, [game?.mines]);
   
   // Yükleniyor durumu
   if (loading) {
@@ -1129,6 +1431,7 @@ export default function GamePlayScreen() {
           selectedTile={selectedTile}
           selectedRackTile={selectedRackTile}
           isAllowedSquare={isAllowedSquare}
+          mines={mines}
         />
         
         {/* Oyuncu harfleri */}

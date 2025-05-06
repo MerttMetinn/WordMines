@@ -77,8 +77,57 @@ export const isValidWord = (word: string): boolean => {
     return false; // Üretimde false döndürerek hileyi engelle
   }
   
-  const normalizedWord = word.trim().toLowerCase();
-  return normalizedWord.length > 1 && turkishWords.has(normalizedWord);
+  // Harfleri görüntüle
+  console.log(`📝 KONTROL: "${word}" - Harflerin kodları:`, Array.from(word).map(c => c.charCodeAt(0)));
+  
+  // Önce direkt kontrol et
+  const originalWord = word.trim().toLowerCase();
+  console.log(`📝 Orjinal kelime: "${originalWord}" (${originalWord.length} harf)`);
+  
+  // Kelime listesini kontrol et
+  if (turkishWords.has(originalWord)) {
+    console.log(`📝 Başarı! Kelime doğrudan bulundu: ${originalWord}`);
+    return true;
+  }
+  
+  // isValidWordWithDiacritics fonksiyonunu deneyelim
+  if (isValidWordWithDiacritics(word)) {
+    console.log(`📝 Başarı! isValidWordWithDiacritics ile bulundu: ${word}`);
+    return true;
+  }
+  
+  // Normalize edilmiş versiyonu deneyelim
+  const normalizedWord = normalizeWord(originalWord);
+  console.log(`📝 Normalize: "${normalizedWord}"`);
+  
+  // Normalize edilmiş hali kelime listesinde var mı?
+  if (turkishWords.has(normalizedWord)) {
+    console.log(`📝 Başarı! Normalize edilmiş haliyle bulundu: ${normalizedWord}`);
+    return true;
+  }
+  
+  // Farklı normalizasyon versiyonları deneyelim
+  const altNormalized = originalWord
+    .replace(/ç/g, 'c')
+    .replace(/ğ/g, 'g')
+    .replace(/ı/g, 'i')
+    .replace(/İ/g, 'i')
+    .replace(/i̇/g, 'i') // gizli i işareti
+    .replace(/ö/g, 'o')
+    .replace(/ş/g, 's')
+    .replace(/ü/g, 'u');
+  
+  console.log(`📝 Alternatif normalize: "${altNormalized}"`);
+  
+  if (turkishWords.has(altNormalized)) {
+    console.log(`📝 Başarı! Alternatif normalize ile bulundu: ${altNormalized}`);
+    return true;
+  }
+  
+  // Başarısız
+  console.log(`📝 Başarısız! Kelime bulunamadı: ${word}`);
+  
+  return false;
 };
 
 /**
@@ -95,7 +144,10 @@ export const isValidWordWithDiacritics = (word: string): boolean => {
   
   // Önce direkt kelimeyi kontrol et
   const originalWord = word.trim().toLowerCase();
+  console.log(`📝 Diacritics kontrolü: "${originalWord}"`);
+  
   if (turkishWords.has(originalWord)) {
+    console.log(`📝 Diacritics - Doğrudan bulundu: ${originalWord}`);
     return true;
   }
   
@@ -104,11 +156,20 @@ export const isValidWordWithDiacritics = (word: string): boolean => {
     .replace(/ç/g, 'c')
     .replace(/ğ/g, 'g')
     .replace(/ı/g, 'i')
+    .replace(/İ/g, 'i')
+    .replace(/i̇/g, 'i') // gizli i işareti
     .replace(/ö/g, 'o')
     .replace(/ş/g, 's')
     .replace(/ü/g, 'u');
   
-  return turkishWords.has(normalizedWord);
+  console.log(`📝 Diacritics - Normalize: "${normalizedWord}"`);
+  
+  if (turkishWords.has(normalizedWord)) {
+    console.log(`📝 Diacritics - Normalize ile bulundu: ${normalizedWord}`);
+    return true;
+  }
+  
+  return false;
 };
 
 // Kelimeler için normalize fonksiyonu
@@ -119,6 +180,8 @@ export const normalizeWord = (word: string): string => {
     .replace(/ç/g, 'c')
     .replace(/ğ/g, 'g')
     .replace(/ı/g, 'i')
+    .replace(/İ/g, 'i')
+    .replace(/i̇/g, 'i') // gizli i işareti
     .replace(/ö/g, 'o')
     .replace(/ş/g, 's')
     .replace(/ü/g, 'u');

@@ -20,6 +20,7 @@ import {
   and
 } from 'firebase/firestore';
 import { db } from '../firebase';
+import { MineType } from './gameConstants';
 
 // Oyun türleri
 export enum GameDurationType {
@@ -63,6 +64,13 @@ export interface Game {
   loser?: string;
   winReason?: string;
   updatedAt?: any; // Timestamp
+  lastPassedBy?: string | null; // Son pas geçen kullanıcı
+  consecutivePassCount?: number; // Arka arkaya pas geçme sayacı
+  mines?: Record<string, { 
+    type: MineType; 
+    isActive: boolean; 
+    isRevealed: boolean; 
+  }>;
 }
 
 /**
