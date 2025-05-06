@@ -5,6 +5,7 @@ import { useEffect, useState, Fragment } from 'react';
 import { AnimatedBackground } from './components/AnimatedBackground';
 import { IntroSequence } from './components/IntroSequence';
 import Animated, { FadeIn, SlideInUp } from 'react-native-reanimated';
+import { loadTurkishWordList } from './utils/wordValidator';
 
 const AnimatedTouchableOpacity = Animated.createAnimatedComponent(TouchableOpacity);
 
@@ -13,6 +14,23 @@ export default function HomeScreen() {
   const { user, loading } = useAuth();
   const [showContent, setShowContent] = useState(false);
   const [introCompleted, setIntroCompleted] = useState(false);
+  const [wordListLoaded, setWordListLoaded] = useState(false);
+
+  // Türkçe kelime listesini yükle
+  useEffect(() => {
+    async function loadWordList() {
+      try {
+        const success = await loadTurkishWordList();
+        setWordListLoaded(success);
+        console.log(`📝 Kelime listesi yükleme ${success ? 'başarılı' : 'başarısız'}`);
+      } catch (error) {
+        console.error('❌ Kelime listesi yükleme hatası:', error);
+        setWordListLoaded(false);
+      }
+    }
+    
+    loadWordList();
+  }, []);
 
   // Kullanıcı giriş yapmış mı kontrol et - useEffect içinde yapalım
   useEffect(() => {
@@ -66,6 +84,15 @@ export default function HomeScreen() {
               Hoş Geldiniz
             </Animated.Text>
             
+            {!wordListLoaded && (
+              <Animated.Text 
+                entering={FadeIn.delay(250).duration(400)}
+                style={styles.loadingText}
+              >
+                Kelime listesi yükleniyor...
+              </Animated.Text>
+            )}
+            
             <AnimatedTouchableOpacity 
               entering={SlideInUp.delay(300).duration(500).springify()}
               style={styles.button} 
@@ -110,6 +137,12 @@ const styles = StyleSheet.create({
     fontSize: 20,
     marginBottom: 40,
     color: '#495057',
+  },
+  loadingText: {
+    fontSize: 16,
+    marginBottom: 20,
+    color: '#6c757d',
+    fontStyle: 'italic'
   },
   button: {
     backgroundColor: '#007bff',

@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
-import { TileData, SpecialTileType, LETTER_POINTS, TILE_SIZE } from '../../utils/gameConstants';
+import { TileData, SpecialTileType, LETTER_POINTS, TILE_SIZE, MineType, MineData, MINE_PROPERTIES, VISUAL_REWARD_PROPERTIES } from '../../utils/gameConstants';
 import { getSpecialTileColor, calculateWordScore } from '../../utils/gameHelpers';
-import { isValidWord } from '../../utils/wordValidator';
+import { isValidWord, normalizeWord } from '../../utils/wordValidator';
 
 interface BoardProps {
   board: TileData[][];
@@ -11,6 +11,7 @@ interface BoardProps {
   selectedTile: TileData | null;
   selectedRackTile?: number | null;
   isAllowedSquare?: (tile: TileData) => boolean;
+  mines?: Map<string, MineData>;  // Mayın bilgisi
 }
 
 // Yeni yatay ve dikey kelime kontrol yapısı
@@ -21,7 +22,10 @@ interface WordInfo {
   isValid: boolean;
 }
 
-const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTile, selectedRackTile, isAllowedSquare }) => {
+// Bazı manuel kelimeler 
+const MANUAL_VALID_WORDS = ['kin', 'kın', 'at', 'el', 'göz', 'dil', 'kız'];
+
+const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTile, selectedRackTile, isAllowedSquare, mines }) => {
   // Tahtadaki kelimeler
   const [horizontalWords, setHorizontalWords] = useState<WordInfo[]>([]);
   const [verticalWords, setVerticalWords] = useState<WordInfo[]>([]);
@@ -39,6 +43,12 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
         return <Text style={styles.specialTileText}>K³</Text>;
       case SpecialTileType.STAR:
         return <Text style={styles.starTileText}>★</Text>;
+      case SpecialTileType.REGION_BAN:
+        return <Text style={[styles.rewardTileText, {color: VISUAL_REWARD_PROPERTIES[type].color}]}>{VISUAL_REWARD_PROPERTIES[type].icon}</Text>;
+      case SpecialTileType.LETTER_BAN:
+        return <Text style={[styles.rewardTileText, {color: VISUAL_REWARD_PROPERTIES[type].color}]}>{VISUAL_REWARD_PROPERTIES[type].icon}</Text>;
+      case SpecialTileType.EXTRA_MOVE:
+        return <Text style={[styles.rewardTileText, {color: VISUAL_REWARD_PROPERTIES[type].color}]}>{VISUAL_REWARD_PROPERTIES[type].icon}</Text>;
       default:
         return null;
     }
@@ -52,9 +62,28 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
     findAllWords();
   }, [board, isMyTurn]);
   
+  // Kelimeyi doğrula - özel manuel kontrolü de ekle
+  const validateWord = (word: string): boolean => {
+    // Kelimeyi loglayalım
+    console.log(`📋 Tahta kelime kontrolü: "${word}"`);
+    
+    // Manuel kontrol
+    if (MANUAL_VALID_WORDS.includes(word.toLowerCase()) || 
+        MANUAL_VALID_WORDS.includes(normalizeWord(word))) {
+      console.log(`📋 "${word}" manuel olarak geçerli kabul edildi!`);
+      return true;
+    }
+    
+    // Normal kontrol
+    const result = isValidWord(word);
+    console.log(`📋 "${word}" kontrol sonucu: ${result ? 'GEÇERLI ✓' : 'GEÇERSİZ ✗'}`);
+    return result;
+  };
+  
   // Tahtadaki yatay kelimeleri bulan fonksiyon
   const findHorizontalWords = (): WordInfo[] => {
     const result: WordInfo[] = [];
+    const candidateWords: WordInfo[] = []; // Aday kelimeleri saklayacak array
     
     for (let row = 0; row < board.length; row++) {
       let currentWord = "";
@@ -67,13 +96,12 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
           currentWord += tile.letter;
           currentTiles.push(tile);
         } else {
-          // Kelime en az 2 harf içeriyorsa kaydet
+          // Kelime en az 2 harf içeriyorsa aday olarak sakla
           if (currentWord.length >= 2) {
             const wordScore = calculateWordScore(currentTiles);
-            // const valid = isValidWord(currentWord);  // Kelime kontrolü devre dışı
-            const valid = true;  // Geçici olarak tüm kelimeleri geçerli kabul et
+            const valid = validateWord(currentWord);
             
-            result.push({
+            candidateWords.push({
               word: currentWord,
               tiles: [...currentTiles],
               score: wordScore,
@@ -90,10 +118,9 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
       // Satır sonundaki kelimeyi kontrol et
       if (currentWord.length >= 2) {
         const wordScore = calculateWordScore(currentTiles);
-        // const valid = isValidWord(currentWord);  // Kelime kontrolü devre dışı
-        const valid = true;  // Geçici olarak tüm kelimeleri geçerli kabul et
+        const valid = validateWord(currentWord);
         
-        result.push({
+        candidateWords.push({
           word: currentWord,
           tiles: [...currentTiles],
           score: wordScore,
@@ -102,12 +129,50 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
       }
     }
     
+    // Aday kelimeleri gruplandır (Aynı konumda başlayan kelimeler)
+    const wordGroups: { [key: string]: WordInfo[] } = {};
+    
+    candidateWords.forEach(wordInfo => {
+      if (wordInfo.tiles.length > 0) {
+        const firstTile = wordInfo.tiles[0];
+        const key = `${firstTile.row},${firstTile.col}`;
+        
+        if (!wordGroups[key]) {
+          wordGroups[key] = [];
+        }
+        
+        wordGroups[key].push(wordInfo);
+      }
+    });
+    
+    // Her grup için en uzun geçerli kelimeyi veya en uzun geçersiz kelimeyi seç
+    Object.values(wordGroups).forEach(group => {
+      if (group.length > 0) {
+        // Uzunluğa göre sırala (en uzun başta)
+        group.sort((a, b) => b.word.length - a.word.length);
+        
+        // Değişiklik: Tüm geçerli kelimeleri ekle
+        const validWords = group.filter(w => w.isValid);
+        
+        if (validWords.length > 0) {
+          // Tüm geçerli kelimeleri sonuç listesine ekle
+          validWords.forEach(validWord => {
+            result.push(validWord);
+          });
+        } else {
+          // Geçerli kelime yoksa, en uzun geçersiz kelimeyi ekle
+          result.push(group[0]);
+        }
+      }
+    });
+    
     return result;
   };
   
   // Tahtadaki dikey kelimeleri bulan fonksiyon
   const findVerticalWords = (): WordInfo[] => {
     const result: WordInfo[] = [];
+    const candidateWords: WordInfo[] = []; // Aday kelimeleri saklayacak array
     
     for (let col = 0; col < board[0].length; col++) {
       let currentWord = "";
@@ -120,13 +185,12 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
           currentWord += tile.letter;
           currentTiles.push(tile);
         } else {
-          // Kelime en az 2 harf içeriyorsa kaydet
+          // Kelime en az 2 harf içeriyorsa aday olarak sakla
           if (currentWord.length >= 2) {
             const wordScore = calculateWordScore(currentTiles);
-            // const valid = isValidWord(currentWord);  // Kelime kontrolü devre dışı
-            const valid = true;  // Geçici olarak tüm kelimeleri geçerli kabul et
+            const valid = validateWord(currentWord);
             
-            result.push({
+            candidateWords.push({
               word: currentWord,
               tiles: [...currentTiles],
               score: wordScore,
@@ -143,10 +207,9 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
       // Sütun sonundaki kelimeyi kontrol et
       if (currentWord.length >= 2) {
         const wordScore = calculateWordScore(currentTiles);
-        // const valid = isValidWord(currentWord);  // Kelime kontrolü devre dışı
-        const valid = true;  // Geçici olarak tüm kelimeleri geçerli kabul et
+        const valid = validateWord(currentWord);
         
-        result.push({
+        candidateWords.push({
           word: currentWord,
           tiles: [...currentTiles],
           score: wordScore,
@@ -154,6 +217,43 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
         });
       }
     }
+    
+    // Aday kelimeleri gruplandır (Aynı konumda başlayan kelimeler)
+    const wordGroups: { [key: string]: WordInfo[] } = {};
+    
+    candidateWords.forEach(wordInfo => {
+      if (wordInfo.tiles.length > 0) {
+        const firstTile = wordInfo.tiles[0];
+        const key = `${firstTile.row},${firstTile.col}`;
+        
+        if (!wordGroups[key]) {
+          wordGroups[key] = [];
+        }
+        
+        wordGroups[key].push(wordInfo);
+      }
+    });
+    
+    // Her grup için en uzun geçerli kelimeyi veya en uzun geçersiz kelimeyi seç
+    Object.values(wordGroups).forEach(group => {
+      if (group.length > 0) {
+        // Uzunluğa göre sırala (en uzun başta)
+        group.sort((a, b) => b.word.length - a.word.length);
+        
+        // Değişiklik: Tüm geçerli kelimeleri ekle
+        const validWords = group.filter(w => w.isValid);
+        
+        if (validWords.length > 0) {
+          // Tüm geçerli kelimeleri sonuç listesine ekle
+          validWords.forEach(validWord => {
+            result.push(validWord);
+          });
+        } else {
+          // Geçerli kelime yoksa, en uzun geçersiz kelimeyi ekle
+          result.push(group[0]);
+        }
+      }
+    });
     
     return result;
   };
@@ -216,18 +316,21 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
       const inHorizontalWord = isTileInWord(tile, horizontalWords);
       const inVerticalWord = isTileInWord(tile, verticalWords);
       
-      if (inHorizontalWord || inVerticalWord) {
-        // Kelime kontrolü devre dışı bırakıldığı için tüm kelimeler geçerli sayılacak
-        // ve her zaman yeşil renk dönecek
-        /*
-        // Herhangi bir kelimede geçersizse kırmızı yap
-        if ((inHorizontalWord && !inHorizontalWord.isValid) || 
-            (inVerticalWord && !inVerticalWord.isValid)) {
-          return '#ffcccc'; // Kırmızı (geçersiz)
+      // Bir harfin ait olduğu TÜM kelimeleri kontrol edelim
+      const allWordsWithTile = [...horizontalWords, ...verticalWords].filter(wordInfo => {
+        return wordInfo.tiles.some(t => t.row === tile.row && t.col === tile.col);
+      });
+      
+      // Değişiklik: Bir harf, en az bir geçerli kelimeye ait olduğunda geçerli kabul edilir
+      const atLeastOneValidWord = allWordsWithTile.some(w => w.isValid);
+      
+      if (allWordsWithTile.length > 0) {
+        // Kelimeler bulundu, geçerli mi kontrol et
+        if (atLeastOneValidWord) {
+          return '#ccffcc'; // Yeşil (geçerli)
+        } else {
+          return '#ffcccc'; // Kırmızı (geçersiz) - hiç geçerli kelime yok
         }
-        */
-        
-        return '#ccffcc'; // Yeşil (geçerli)
       }
       
       return '#fff0cc'; // Sarı (henüz bir kelime parçası değil)
@@ -235,6 +338,40 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
     
     // Normal dolmuş kare
     return '#d1ecff';
+  };
+  
+  // Mayın ikonunu döndür
+  const getMineIcon = (row: number, col: number): JSX.Element | null => {
+    if (!mines) {
+      console.log('Mines prop is undefined');
+      return null;
+    }
+    
+    const position = `${row},${col}`;
+    const mine = mines.get(position);
+    
+    // Debug bilgisi ekleyelim - hangi mayının nerede olduğunu görelim
+    if (mine) {
+      console.log(`[${row},${col}] koordinatında ${mine.type} tipinde mayın var. Aktif: ${mine.isActive}, Görünür: ${mine.isRevealed}`);
+    }
+    
+    if (mine && mine.isRevealed) {
+      console.log(`Mayın gösteriliyor: ${position}, tip=${mine.type}`);
+      
+      // Mayın tipi için özellikler mevcut mu kontrol et
+      if (mine.type !== MineType.NONE && MINE_PROPERTIES[mine.type]) {
+        const mineProps = MINE_PROPERTIES[mine.type];
+        return (
+          <View style={[styles.mineContainer, { backgroundColor: mineProps.color }]}>
+            <Text style={styles.mineIcon}>{mineProps.icon}</Text>
+          </View>
+        );
+      } else {
+        console.error(`Bilinmeyen mayın tipi: ${mine.type}`);
+      }
+    }
+    
+    return null;
   };
 
   return (
@@ -271,7 +408,6 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
                 styles.tile,
                 { backgroundColor: getTileColor(tile) },
                 selectedTile?.row === tile.row && selectedTile?.col === tile.col && styles.selectedTile,
-                // İzin verilen kareleri seçilebilir hale getir
                 isMyTurn && 
                 selectedRackTile !== null && 
                 isAllowedSquare && 
@@ -289,7 +425,9 @@ const Board: React.FC<BoardProps> = ({ board, isMyTurn, onTilePress, selectedTil
                   </Text>
                 </View>
               ) : (
-                getSpecialTileIcon(tile.type)
+                <>
+                  {getMineIcon(tile.row, tile.col) || getSpecialTileIcon(tile.type)}
+                </>
               )}
             </TouchableOpacity>
           ))}
@@ -376,6 +514,13 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 1,
   },
+  rewardTileText: {
+    fontSize: TILE_SIZE * 0.6,
+    fontWeight: 'bold',
+    textShadowColor: 'rgba(255, 255, 255, 0.5)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 1,
+  },
   wordScoreInfo: {
     padding: 8,
     backgroundColor: '#f8f8f8',
@@ -391,7 +536,20 @@ const styles = StyleSheet.create({
   },
   invalidWordText: {
     color: '#dc3545',
-  }
+  },
+  mineContainer: {
+    position: 'absolute',
+    width: '90%',
+    height: '90%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 5,
+    opacity: 0.7,
+  },
+  mineIcon: {
+    fontSize: TILE_SIZE * 0.5,
+    fontWeight: 'bold',
+  },
 });
 
 export default Board; 
